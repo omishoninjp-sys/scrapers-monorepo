@@ -983,36 +983,6 @@ def upload_to_shopify(product, collection_id=None):
 
 # ========== Flask 路由 ==========
 
-@app.route('/')
-def index():
-    """首頁"""
-    token_loaded = load_shopify_token()
-    return render_template('index.html', token_loaded=token_loaded)
-
-
-@app.route('/api/status')
-def get_status():
-    """取得爬取狀態"""
-    return jsonify(scrape_status)
-
-
-@app.route('/api/start-scrape', methods=['POST'])
-def start_scrape():
-    """開始爬取"""
-    global scrape_status
-    
-    if scrape_status['running']:
-        return jsonify({'success': False, 'error': '爬取正在進行中'})
-    
-    if not load_shopify_token():
-        return jsonify({'success': False, 'error': '找不到 shopify_token.json'})
-    
-    thread = threading.Thread(target=run_scrape)
-    thread.start()
-    
-    return jsonify({'success': True, 'message': '開始爬取'})
-
-
 def run_scrape():
     """執行爬取流程"""
     global scrape_status

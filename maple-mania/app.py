@@ -1316,6 +1316,42 @@ def start_scrape():
     return jsonify({'success': True, 'message': '開始爬取'})
 
 
+@app.route('/api/start', methods=['POST'])
+def cron_trigger():
+    """
+    Cron Job 觸發端點
+    用於 cron-job.org 定時觸發爬取
+    """
+    global scrape_status
+    
+    # 檢查是否正在執行
+    if scrape_status['running']:
+        return jsonify({
+            'success': False, 
+            'error': '爬取正在進行中',
+            'status': 'running',
+            'progress': scrape_status['progress'],
+            'total': scrape_status['total']
+        }), 409
+    
+    # 載入 Token
+    if not load_shopify_token():
+        return jsonify({
+            'success': False, 
+            'error': '未設定環境變數 (SHOPIFY_ACCESS_TOKEN, SHOPIFY_SHOP)'
+        }), 500
+    
+    # 啟動爬取
+    thread = threading.Thread(target=run_scrape)
+    thread.start()
+    
+    return jsonify({
+        'success': True, 
+        'message': 'Cron job triggered - 爬取已啟動',
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+
 if __name__ == '__main__':
     print("=" * 50)
     print("The Maple Mania 楓糖男孩 爬蟲工具")

@@ -126,7 +126,7 @@ def translate_with_chatgpt(title, description):
 請回傳 JSON 格式（不要加 markdown 標記）：
 {{
     "title": "翻譯後的商品名稱（繁體中文，簡潔有力，前面加上 Gateau Festa Harada）",
-    "description": "翻譯後的商品說明（繁體中文，保留原意但更流暢，適合電商展示）",
+    "description": "翻譯後的商品說明（繁體中文，保留原意但更流暢，適合電商展示，每個重點資訊用 <br> 換行）",
     "page_title": "SEO 頁面標題（繁體中文，包含品牌和商品特色，50-60字以內）",
     "meta_description": "SEO 描述（繁體中文，吸引點擊，包含關鍵字，100字以內）"
 }}
@@ -138,7 +138,8 @@ def translate_with_chatgpt(title, description):
 4. 商品標題開頭必須是「Gateau Festa Harada」（英文）
 5. 【禁止使用任何日文】所有內容必須是繁體中文或英文
 6. SEO 內容要包含：Gateau Festa Harada、日本、法式脆餅、伴手禮、送禮等關鍵字
-7. 只回傳 JSON，不要其他文字"""
+7. description 中每個重點（內容量、賞味期限、尺寸、重量等）要用 <br> 換行，方便閱讀
+8. 只回傳 JSON，不要其他文字"""
 
     try:
         response = requests.post(
@@ -536,13 +537,26 @@ def scrape_product_list():
                     volume_weight = size_info.get('volume_weight', 0) if size_info else 0
                     final_weight = max(actual_weight, volume_weight)
                     
-                    # 圖片 URL
-                    img_url = f"{BASE_URL}/img/goods/L/{sku}.jpg"
+                    # 圖片 URL - 嘗試多種前綴
+                    images = []
+                    image_prefixes = ['L', '2', '3', '4', '5', '6', '7', '8']
+                    for prefix in image_prefixes:
+                        img_url = f"{BASE_URL}/img/goods/{prefix}/{sku}.jpg"
+                        try:
+                            head_resp = requests.head(img_url, headers=HEADERS, timeout=5)
+                            if head_resp.status_code == 200:
+                                images.append(img_url)
+                        except:
+                            pass
+                    
+                    # 如果沒找到，至少加入 L 圖
+                    if not images:
+                        images.append(f"{BASE_URL}/img/goods/L/{sku}.jpg")
                     
                     # 商品頁 URL
                     product_url = f"{BASE_URL}/shop/g/g{sku}/"
                     
-                    # 組合描述
+                    # 組合描述（使用 HTML 換行）
                     description_parts = []
                     if content:
                         description_parts.append(f"內容量：{content}")
@@ -558,18 +572,18 @@ def scrape_product_list():
                         'title': title,
                         'price': price,
                         'url': product_url,
-                        'images': [img_url],
+                        'images': images,
                         'weight': round(final_weight, 2),
                         'actual_weight': actual_weight,
                         'volume_weight': volume_weight,
-                        'description': '\n'.join(description_parts),
+                        'description': '<br>'.join(description_parts),
                         'content': content,
                         'shelf_life': shelf_life,
                         'size_text': size_text,
                     }
                     
                     products.append(product)
-                    print(f"[商品] SKU: {sku}, 價格: ¥{price}, 重量: {final_weight}kg")
+                    print(f"[商品] SKU: {sku}, 價格: ¥{price}, 重量: {final_weight}kg, 圖片: {len(images)}張")
                     
                 except Exception as e:
                     print(f"[ERROR] 解析商品區塊失敗: {e}")
@@ -611,7 +625,7 @@ def upload_to_shopify(product, collection_id=None):
         if not img_url or not img_url.startswith('http'):
             continue
         
-        print(f"[圖片] 下載中: {img_url}")
+        print(f"[圖片] 下載中 ({idx+1}/{len(img_urls)}): {img_url}")
         result = download_image_to_base64(img_url)
         
         if result['success']:
@@ -620,11 +634,13 @@ def upload_to_shopify(product, collection_id=None):
                 'position': idx + 1,
                 'filename': f"harada_{product['sku']}_{idx+1}.jpg"
             })
-            print(f"[圖片] ✓ 下載成功")
+            print(f"[圖片] ✓ 下載成功 ({idx+1}/{len(img_urls)})")
         else:
-            print(f"[圖片] ✗ 下載失敗")
+            print(f"[圖片] ✗ 下載失敗 ({idx+1}/{len(img_urls)})")
         
         time.sleep(0.3)
+    
+    print(f"[圖片] 成功下載 {len(images_base64)}/{len(img_urls)} 張圖片")
     
     shopify_product = {
         'product': {

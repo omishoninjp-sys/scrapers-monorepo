@@ -1088,6 +1088,22 @@ def start_scrape():
     
     return jsonify({'success': True, 'message': '開始爬取'})
 
+@app.route('/api/start', methods=['POST'])
+def api_start():
+    """Cron-job 觸發端點"""
+    global scrape_status
+    
+    if scrape_status['running']:
+        return jsonify({'success': False, 'error': '爬取正在進行中'})
+    
+    if not load_shopify_token():
+        return jsonify({'success': False, 'error': '找不到 Shopify 設定'})
+    
+    thread = threading.Thread(target=run_scrape)
+    thread.start()
+    
+    return jsonify({'success': True, 'message': 'Francais 爬蟲已啟動'})
+
 def run_scrape():
     """執行爬取流程"""
     global scrape_status

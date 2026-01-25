@@ -862,8 +862,11 @@ def scrape_shopify_products():
 
 def get_or_create_collection(collection_title="虎屋羊羹"):
     """取得或建立 Collection"""
+    from urllib.parse import quote
+    
+    # 先取得所有 collections，因為 title 參數對中文支援不好
     response = requests.get(
-        shopify_api_url(f'custom_collections.json?title={collection_title}'),
+        shopify_api_url('custom_collections.json?limit=250'),
         headers=get_shopify_headers()
     )
     
@@ -871,9 +874,11 @@ def get_or_create_collection(collection_title="虎屋羊羹"):
         collections = response.json().get('custom_collections', [])
         for col in collections:
             if col['title'] == collection_title:
+                print(f"[Collection] 找到現有 Collection: {collection_title} (ID: {col['id']})")
                 return col['id']
     
     # 不存在則建立
+    print(f"[Collection] 建立新的 Collection: {collection_title}")
     response = requests.post(
         shopify_api_url('custom_collections.json'),
         headers=get_shopify_headers(),
@@ -886,8 +891,11 @@ def get_or_create_collection(collection_title="虎屋羊羹"):
     )
     
     if response.status_code == 201:
-        return response.json()['custom_collection']['id']
+        new_id = response.json()['custom_collection']['id']
+        print(f"[Collection] 建立成功，ID: {new_id}")
+        return new_id
     
+    print(f"[Collection] 建立失敗: {response.status_code} - {response.text}")
     return None
 
 def add_product_to_collection(product_id, collection_id):

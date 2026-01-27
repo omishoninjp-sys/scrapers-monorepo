@@ -1193,6 +1193,7 @@ def run_scrape():
             result = upload_to_shopify(product, collection_id)
             if result['success']:
                 print(f"[成功] 上傳 SKU {product['sku']}")
+                existing_skus.add(product['sku'])  # 防止同一批次重複上架
                 scrape_status['uploaded'] += 1
                 scrape_status['products'].append({
                     'sku': product['sku'],

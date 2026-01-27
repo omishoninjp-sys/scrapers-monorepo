@@ -1092,6 +1092,7 @@ def run_scrape():
             if result['success']:
                 translated_title = result.get('translated', {}).get('title', product['title'])
                 print(f"[成功] {translated_title}")
+                existing_skus.add(product['sku'])  # 防止同一批次重複上架
                 scrape_status['uploaded'] += 1
                 scrape_status['products'].append({
                     'sku': product['sku'],

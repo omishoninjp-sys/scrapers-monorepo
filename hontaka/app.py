@@ -232,6 +232,10 @@ def download_image_to_base64(img_url, max_retries=3):
         'Connection': 'keep-alive',
     }
     
+    # 針對 akamaized.net CDN 調整 headers
+    if 'akamaized.net' in img_url:
+        headers['Referer'] = 'https://www.hontaka-shop.com/'
+    
     for attempt in range(max_retries):
         try:
             response = requests.get(img_url, headers=headers, timeout=30)
@@ -673,19 +677,36 @@ def scrape_product_detail(url):
             print(f"[商品編碼] {product['product_code']}")
         
         # ========== 價格 ==========
-        # 格式: 5,400円（税込）
-        price_pattern = r'(\d{1,3}(?:,\d{3})*)\s*円'
-        price_matches = re.findall(price_pattern, page_text)
-        if price_matches:
-            # 取第一個合理的價格
-            for pm in price_matches:
+        # 優先從 hidden input 取得價格: <input type="hidden" name="price1" value="1188">
+        price_input = soup.find('input', {'name': 'price1'})
+        if price_input and price_input.get('value'):
+            try:
+                product['price'] = int(price_input.get('value').replace(',', ''))
+            except:
+                pass
+        
+        # 備用：從 M_price2 input 取得
+        if not product['price']:
+            price_input2 = soup.find('input', {'id': 'M_price2'})
+            if price_input2 and price_input2.get('value'):
                 try:
-                    price_val = int(pm.replace(',', ''))
-                    if price_val >= 100:  # 過濾太小的數字
-                        product['price'] = price_val
-                        break
+                    product['price'] = int(price_input2.get('value').replace(',', ''))
                 except:
                     pass
+        
+        # 再備用：從頁面文字抓取
+        if not product['price']:
+            price_pattern = r'(\d{1,3}(?:,\d{3})*)\s*円'
+            price_matches = re.findall(price_pattern, page_text)
+            if price_matches:
+                for pm in price_matches:
+                    try:
+                        price_val = int(pm.replace(',', ''))
+                        if price_val >= 100:
+                            product['price'] = price_val
+                            break
+                    except:
+                        pass
         
         print(f"[價格] ¥{product['price']}")
         
@@ -740,44 +761,41 @@ def scrape_product_detail(url):
         
         # ========== 圖片 ==========
         images = []
+        seen_images = set()
         
-        # 從 makeshop 圖片服務器找圖片
-        # 格式: https://gigaplus.makeshop.jp/shophontaka/...
-        img_tags = soup.find_all('img', src=re.compile(r'gigaplus\.makeshop\.jp'))
+        # 從 makeshop-multi-images.akamaized.net 找圖片
+        # 格式: https://makeshop-multi-images.akamaized.net/shophontaka/shopimages/44/01/9_000000000144.jpg
+        img_tags = soup.find_all('img', src=re.compile(r'makeshop-multi-images\.akamaized\.net'))
         for img in img_tags:
             src = img.get('src', '')
             if src and 'shophontaka' in src:
-                # 過濾掉小圖示和按鈕
-                if '/samplesource/' in src or '/top/' in src:
+                # 過濾掉縮圖（以 s 開頭的檔名）
+                # 縮圖格式: s9_000000000144.jpg
+                # 主圖格式: 9_000000000144.jpg
+                filename = src.split('/')[-1].split('?')[0]
+                if filename.startswith('s') and filename[1].isdigit():
                     continue
-                if src not in images:
+                
+                # 移除 query string 來去重
+                clean_src = src.split('?')[0]
+                if clean_src not in seen_images:
+                    seen_images.add(clean_src)
                     images.append(src)
         
-        # 備用：從 JavaScript 找圖片 URL
+        # 備用：從整個 HTML 找圖片 URL
         if not images:
-            # 找 open_image_view_window 相關的圖片
             script_text = str(soup)
-            img_pattern = r'(https://gigaplus\.makeshop\.jp/shophontaka/[^"\']+\.(?:jpg|jpeg|png|gif))'
+            img_pattern = r'(https://makeshop-multi-images\.akamaized\.net/shophontaka/shopimages/[^"\']+\.(?:jpg|jpeg|png|gif))'
             found_images = re.findall(img_pattern, script_text, re.IGNORECASE)
             for img_url in found_images:
-                if img_url not in images and '/samplesource/' not in img_url:
+                filename = img_url.split('/')[-1].split('?')[0]
+                # 過濾縮圖
+                if filename.startswith('s') and filename[1].isdigit():
+                    continue
+                clean_url = img_url.split('?')[0]
+                if clean_url not in seen_images:
+                    seen_images.add(clean_url)
                     images.append(img_url)
-        
-        # 嘗試構建標準圖片 URL
-        if not images and product['sku']:
-            # 常見的 makeshop 圖片格式
-            possible_paths = [
-                f"https://gigaplus.makeshop.jp/shophontaka/products/{product['sku']}.jpg",
-                f"https://gigaplus.makeshop.jp/shophontaka/{product['sku']}.jpg",
-            ]
-            for path in possible_paths:
-                try:
-                    test_resp = requests.head(path, headers=HEADERS, timeout=5)
-                    if test_resp.status_code == 200:
-                        images.append(path)
-                        break
-                except:
-                    pass
         
         product['images'] = images[:10]
         print(f"[圖片] 找到 {len(product['images'])} 張圖片")

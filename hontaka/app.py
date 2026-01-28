@@ -764,11 +764,20 @@ def scrape_product_detail(url):
         seen_images = set()
         
         # 從 makeshop-multi-images.akamaized.net 找圖片
-        # 格式: https://makeshop-multi-images.akamaized.net/shophontaka/shopimages/44/01/9_000000000144.jpg
+        # 商品主圖格式: https://makeshop-multi-images.akamaized.net/shophontaka/shopimages/44/01/9_000000000144.jpg
+        # 關聯商品格式: https://makeshop-multi-images.akamaized.net/shophontaka/itemimages/... (要排除)
         img_tags = soup.find_all('img', src=re.compile(r'makeshop-multi-images\.akamaized\.net'))
         for img in img_tags:
             src = img.get('src', '')
             if src and 'shophontaka' in src:
+                # 排除關聯商品的圖片（itemimages 路徑）
+                if '/itemimages/' in src:
+                    continue
+                
+                # 只抓 shopimages 路徑的圖片
+                if '/shopimages/' not in src:
+                    continue
+                
                 # 過濾掉縮圖（以 s 開頭的檔名）
                 # 縮圖格式: s9_000000000144.jpg
                 # 主圖格式: 9_000000000144.jpg
@@ -782,7 +791,7 @@ def scrape_product_detail(url):
                     seen_images.add(clean_src)
                     images.append(src)
         
-        # 備用：從整個 HTML 找圖片 URL
+        # 備用：從整個 HTML 找圖片 URL（只找 shopimages）
         if not images:
             script_text = str(soup)
             img_pattern = r'(https://makeshop-multi-images\.akamaized\.net/shophontaka/shopimages/[^"\']+\.(?:jpg|jpeg|png|gif))'

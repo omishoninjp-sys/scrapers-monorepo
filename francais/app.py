@@ -99,6 +99,18 @@ def shopify_api_url(endpoint):
     """建立 Shopify API URL"""
     return f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/{endpoint}"
 
+
+def normalize_sku(sku):
+    """
+    標準化 SKU 格式
+    - 去除前後空格
+    - 轉小寫（Francais SKU 通常是小寫英數字）
+    """
+    if not sku:
+        return ""
+    return sku.strip().lower()
+
+
 def calculate_selling_price(cost, weight):
     """
     計算售價
@@ -293,7 +305,10 @@ def get_existing_skus():
     return set(products_map.keys())
 
 def get_existing_products_map():
-    """取得 Shopify 已存在的商品，回傳 {sku: product_id} 字典"""
+    """
+    取得 Shopify 全站已存在的商品，回傳 {normalized_sku: product_id}
+    ★ 用於檢查是否已存在，避免重複上架
+    """
     products_map = {}
     url = shopify_api_url("products.json?limit=250")
     
@@ -309,7 +324,12 @@ def get_existing_products_map():
             for variant in product.get('variants', []):
                 sku = variant.get('sku')
                 if sku and product_id:
-                    products_map[sku] = product_id
+                    # ★ 使用標準化的 SKU 作為 key
+                    normalized = normalize_sku(sku)
+                    products_map[normalized] = product_id
+                    # 同時保留原始 SKU（以防萬一）
+                    if sku != normalized:
+                        products_map[sku] = product_id
         
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
@@ -324,7 +344,10 @@ def get_existing_products_map():
     return products_map
 
 def get_collection_products_map(collection_id):
-    """只取得特定 Collection 內的商品，回傳 {sku: product_id} 字典"""
+    """
+    取得特定 Collection 內的商品，回傳 {normalized_sku: product_id}
+    ★ 用於檢查哪些商品需要設為草稿
+    """
     products_map = {}
     if not collection_id:
         return products_map
@@ -342,7 +365,9 @@ def get_collection_products_map(collection_id):
             for variant in product.get('variants', []):
                 sku = variant.get('sku')
                 if sku and product_id:
-                    products_map[sku] = product_id
+                    # ★ 使用標準化的 SKU 作為 key
+                    normalized = normalize_sku(sku)
+                    products_map[normalized] = product_id
         
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
@@ -607,7 +632,9 @@ def scrape_product_list():
                 if not sku_match:
                     continue
                 
-                sku = sku_match.group(1)
+                sku_raw = sku_match.group(1)
+                # ★ 標準化 SKU
+                sku = normalize_sku(sku_raw)
                 
                 if sku in seen_skus:
                     continue
@@ -616,7 +643,8 @@ def scrape_product_list():
                 full_url = urljoin(BASE_URL, href)
                 page_products.append({
                     'url': full_url,
-                    'sku': sku
+                    'sku': sku,
+                    'sku_raw': sku_raw  # 保留原始 SKU（用於 URL）
                 })
             
             print(f"[INFO] 第 {page_num} 頁找到 {len(page_products)} 個商品")
@@ -657,6 +685,7 @@ def scrape_product_detail(url):
         'in_stock': True,
         'is_point_product': False,  # 點數商品標記
         'sku': '',
+        'sku_raw': '',
         'content': '',  # 內容
         'allergens': '',  # 過敏原
         'shelf_life': ''  # 賞味期限
@@ -664,7 +693,8 @@ def scrape_product_detail(url):
     
     sku_match = re.search(r'/shop/g/g([^/]+)/?', url)
     if sku_match:
-        product['sku'] = sku_match.group(1)
+        product['sku_raw'] = sku_match.group(1)
+        product['sku'] = normalize_sku(product['sku_raw'])
     
     try:
         print(f"[載入] {url}")
@@ -761,7 +791,7 @@ def scrape_product_detail(url):
         
         # ========== 圖片抓取 ==========
         images = []
-        sku = product['sku']
+        sku_raw = product['sku_raw']
         
         # 根據網站結構，圖片 URL 格式為:
         # /img/goods/L/{sku}.jpg - 主圖
@@ -770,19 +800,19 @@ def scrape_product_detail(url):
         image_prefixes = ['L', '2', '3', '4', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8']
         
         for prefix in image_prefixes:
-            img_url = f"{BASE_URL}/img/goods/{prefix}/{sku}.jpg"
+            img_url = f"{BASE_URL}/img/goods/{prefix}/{sku_raw}.jpg"
             # 驗證圖片是否存在
             try:
                 head_response = requests.head(img_url, headers=HEADERS, timeout=5)
                 if head_response.status_code == 200:
                     images.append(img_url)
-                    print(f"[圖片] 找到: {prefix}/{sku}.jpg")
+                    print(f"[圖片] 找到: {prefix}/{sku_raw}.jpg")
             except:
                 pass
         
         # 如果上述方法沒找到圖片，從頁面上提取
         if not images:
-            img_tags = soup.find_all('img', src=re.compile(sku))
+            img_tags = soup.find_all('img', src=re.compile(sku_raw))
             for img in img_tags:
                 src = img.get('src', '')
                 if src and src not in images:
@@ -862,7 +892,7 @@ def upload_to_shopify(product, collection_id=None):
             'status': 'active',
             'published': True,
             'variants': [{
-                'sku': product['sku'],
+                'sku': product['sku'],  # 使用標準化的 SKU
                 'price': f"{selling_price:.2f}",
                 'weight': product.get('weight', 0),
                 'weight_unit': 'kg',
@@ -1123,33 +1153,39 @@ def run_scrape():
             "deleted": 0
         }
         
-        # 1. 取得或建立 Collection
+        # ★ 1. 取得 Shopify 全站已有商品（用於檢查是否已存在，避免重複上架）
+        scrape_status['current_product'] = "正在檢查 Shopify 已有商品..."
+        all_products_map = get_existing_products_map()
+        existing_skus = set(all_products_map.keys())
+        print(f"[INFO] Shopify 全站已有 {len(existing_skus)} 個商品（含標準化 SKU）")
+        
+        # 2. 取得或建立 Collection
         scrape_status['current_product'] = "正在設定 Collection..."
         collection_id = get_or_create_collection("Francais")
         print(f"[INFO] Collection ID: {collection_id}")
         
-        # 2. 取得 Collection 內的商品（只檢查這個 Collection）
+        # ★ 3. 取得 Collection 內的商品（用於設為草稿）
         scrape_status['current_product'] = "正在取得 Collection 內商品..."
         collection_products_map = get_collection_products_map(collection_id)
-        existing_skus = set(collection_products_map.keys())
-        print(f"[INFO] Francais Collection 內有 {len(existing_skus)} 個商品")
+        collection_skus = set(collection_products_map.keys())
+        print(f"[INFO] Francais Collection 內有 {len(collection_skus)} 個商品")
         
-        # 3. 爬取商品列表
+        # 4. 爬取商品列表
         scrape_status['current_product'] = "正在爬取商品列表..."
         product_list = scrape_product_list()
         scrape_status['total'] = len(product_list)
         print(f"[INFO] 找到 {len(product_list)} 個商品")
         
-        # 取得官網所有 SKU
+        # 取得官網所有 SKU（已標準化）
         website_skus = set(item['sku'] for item in product_list)
         print(f"[INFO] 官網 SKU 列表: {len(website_skus)} 個")
         
-        # 4. 逐一處理商品
+        # 5. 逐一處理商品
         for idx, item in enumerate(product_list):
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理中: {item['sku']}"
             
-            # 檢查是否已存在
+            # ★ 檢查全站是否已存在（不只是 Collection）
             if item['sku'] in existing_skus:
                 print(f"[跳過] 已存在: {item['sku']}")
                 scrape_status['skipped_exists'] += 1
@@ -1194,7 +1230,8 @@ def run_scrape():
             if result['success']:
                 translated_title = result.get('translated', {}).get('title', product['title'])
                 print(f"[成功] {translated_title}")
-                existing_skus.add(product['sku'])  # 防止同一批次重複上架
+                # ★ 上傳成功後加入 existing_skus，防止同一批次重複上架
+                existing_skus.add(product['sku'])
                 scrape_status['uploaded'] += 1
                 scrape_status['products'].append({
                     'sku': product['sku'],
@@ -1221,12 +1258,12 @@ def run_scrape():
             
             time.sleep(1)
         
-        # 5. 設為草稿：Collection 內但官網已下架的商品
+        # ★ 6. 設為草稿：只針對 Collection 內、但官網已下架的商品
         scrape_status['current_product'] = "正在檢查已下架商品..."
-        skus_to_draft = existing_skus - website_skus
+        skus_to_draft = collection_skus - website_skus
         
         if skus_to_draft:
-            print(f"[INFO] 發現 {len(skus_to_draft)} 個商品需要設為草稿")
+            print(f"[INFO] 發現 {len(skus_to_draft)} 個商品需要設為草稿: {skus_to_draft}")
             for sku in skus_to_draft:
                 scrape_status['current_product'] = f"設為草稿: {sku}"
                 product_id = collection_products_map.get(sku)

@@ -224,13 +224,30 @@ def shopify_api_url(endpoint):
     """建立 Shopify API URL"""
     return f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/{endpoint}"
 
+def normalize_sku(sku_or_brandcode):
+    """
+    標準化 SKU 格式
+    移除前導零，確保 FGT-000000000539 和 FGT-539 被視為同一商品
+    """
+    if sku_or_brandcode.startswith('FGT-'):
+        brandcode = sku_or_brandcode[4:]  # 移除 'FGT-' 前綴
+    else:
+        brandcode = sku_or_brandcode
+    
+    try:
+        # 移除前導零
+        normalized = str(int(brandcode))
+        return f"FGT-{normalized}"
+    except ValueError:
+        return sku_or_brandcode
+
 def get_existing_skus():
     """取得 Shopify 已存在的 SKU 列表（只回傳 SKU set，向下相容）"""
     products_map = get_existing_products_map()
     return set(products_map.keys())
 
 def get_existing_products_map():
-    """取得 Shopify 已存在的商品，回傳 {sku: product_id} 字典"""
+    """取得 Shopify 已存在的商品，回傳 {normalized_sku: product_id} 字典"""
     products_map = {}
     url = shopify_api_url("products.json?limit=250")
     
@@ -246,7 +263,12 @@ def get_existing_products_map():
             for variant in product.get('variants', []):
                 sku = variant.get('sku')
                 if sku and product_id:
-                    products_map[sku] = product_id
+                    # ★ 使用標準化的 SKU 作為 key
+                    normalized = normalize_sku(sku)
+                    products_map[normalized] = product_id
+                    # 同時保留原始 SKU（以防萬一）
+                    if sku != normalized:
+                        products_map[sku] = product_id
         
         # 處理分頁
         link_header = response.headers.get('Link', '')
@@ -262,7 +284,7 @@ def get_existing_products_map():
     return products_map
 
 def get_collection_products_map(collection_id):
-    """只取得特定 Collection 內的商品，回傳 {sku: product_id} 字典"""
+    """只取得特定 Collection 內的商品，回傳 {normalized_sku: product_id} 字典"""
     products_map = {}
     
     if not collection_id:
@@ -283,7 +305,9 @@ def get_collection_products_map(collection_id):
             for variant in product.get('variants', []):
                 sku = variant.get('sku')
                 if sku and product_id:
-                    products_map[sku] = product_id
+                    # ★ 使用標準化的 SKU 作為 key
+                    normalized = normalize_sku(sku)
+                    products_map[normalized] = product_id
         
         # 處理分頁
         link_header = response.headers.get('Link', '')
@@ -407,7 +431,7 @@ def scrape_product_list():
     商品連結格式：/shop/shopdetail.html?brandcode=000000000539&amp;search=&amp;sort=
     """
     products = []
-    seen_skus = set()
+    seen_skus = set()  # 使用標準化的 SKU
     
     # 先訪問首頁取得 cookies
     session.get(BASE_URL, timeout=30)
@@ -452,7 +476,7 @@ def scrape_product_list():
             print(f"[DEBUG] 找到 {len(product_links)} 個商品連結")
             
             new_count = 0
-            seen_brandcodes = set()
+            seen_brandcodes = set()  # 用標準化的 brandcode（整數）
             
             for link in product_links:
                 href = link.get('href', '')
@@ -463,23 +487,27 @@ def scrape_product_list():
                 sku_match = re.search(r'brandcode=(\d+)', href)
                 
                 if sku_match:
-                    brandcode = sku_match.group(1)
+                    brandcode_raw = sku_match.group(1)
+                    # ★ 統一格式：移除前導零（避免 000000000539 和 539 被視為不同商品）
+                    brandcode_normalized = str(int(brandcode_raw))
                     
                     # 跳過已處理的 brandcode（同一商品可能有多個連結）
-                    if brandcode in seen_brandcodes:
+                    if brandcode_normalized in seen_brandcodes:
                         continue
-                    seen_brandcodes.add(brandcode)
+                    seen_brandcodes.add(brandcode_normalized)
                     
-                    sku = f"FGT-{brandcode}"
+                    # ★ SKU 使用標準化的格式
+                    sku = f"FGT-{brandcode_normalized}"
                     
-                    # 使用詳情頁 URL 格式
-                    full_url = f"{BASE_URL}/shopdetail/{brandcode}/"
+                    # 使用詳情頁 URL 格式（保留原始 brandcode，網站可能需要完整格式）
+                    full_url = f"{BASE_URL}/shopdetail/{brandcode_raw}/"
                     
                     if sku not in seen_skus:
                         products.append({
                             'url': full_url,
                             'sku': sku,
-                            'brandcode': brandcode
+                            'brandcode': brandcode_normalized,
+                            'brandcode_raw': brandcode_raw
                         })
                         seen_skus.add(sku)
                         new_count += 1
@@ -580,16 +608,21 @@ def scrape_product_detail(url):
         print(f"[DEBUG] 價格: {price}")
         
         # === 商品編號（SKU）===
-        # 從 URL 取得 brandcode
+        # 從 URL 取得 brandcode，並標準化格式
         sku = ""
         brandcode_match = re.search(r'/shopdetail/(\d+)/', url)
         if brandcode_match:
-            sku = f"FGT-{brandcode_match.group(1)}"
+            brandcode_raw = brandcode_match.group(1)
+            # ★ 標準化 SKU 格式：移除前導零
+            brandcode_normalized = str(int(brandcode_raw))
+            sku = f"FGT-{brandcode_normalized}"
         else:
             # 從頁面取得商品コード
             code_match = re.search(r'商品コード\s*[：:]\s*(\d+)', page_text)
             if code_match:
-                sku = f"FGT-{code_match.group(1)}"
+                brandcode_raw = code_match.group(1)
+                brandcode_normalized = str(int(brandcode_raw))
+                sku = f"FGT-{brandcode_normalized}"
         
         print(f"[DEBUG] SKU: {sku}")
         
@@ -856,7 +889,7 @@ def upload_to_shopify(product, collection_id=None):
             'status': 'active',
             'published': True,
             'variants': [{
-                'sku': product['sku'],
+                'sku': product['sku'],  # 已經是標準化格式
                 'price': f"{selling_price:.2f}",
                 'weight': product.get('weight', 0),
                 'weight_unit': 'kg',
@@ -1141,7 +1174,7 @@ def run_scrape():
         scrape_status['current_product'] = "正在檢查 Shopify 已有商品..."
         existing_products_map = get_existing_products_map()
         existing_skus = set(existing_products_map.keys())
-        print(f"[INFO] Shopify 全站已有 {len(existing_skus)} 個商品")
+        print(f"[INFO] Shopify 全站已有 {len(existing_skus)} 個商品（含標準化 SKU）")
         
         # 2. 取得或建立 Collection
         scrape_status['current_product'] = "正在設定 Collection..."
@@ -1160,7 +1193,7 @@ def run_scrape():
         scrape_status['total'] = len(product_list)
         print(f"[INFO] 找到 {len(product_list)} 個商品")
         
-        # 取得官網所有 SKU（用於草稿比對）
+        # 取得官網所有 SKU（用於草稿比對，已標準化）
         website_skus = set(item['sku'] for item in product_list)
         print(f"[INFO] 官網 SKU 列表: {len(website_skus)} 個")
         
@@ -1169,6 +1202,7 @@ def run_scrape():
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理: {item['sku']}"
             
+            # ★ 檢查列表頁的 SKU（已標準化）
             if item['sku'] in existing_skus:
                 print(f"[跳過] SKU {item['sku']} 已存在")
                 scrape_status['skipped'] += 1
@@ -1177,6 +1211,12 @@ def run_scrape():
             product = scrape_product_detail(item['url'])
             if not product:
                 scrape_status['errors'].append(f"無法爬取: {item['url']}")
+                continue
+            
+            # ★ 再次檢查詳情頁的 SKU（以防萬一格式不一致）
+            if product['sku'] in existing_skus:
+                print(f"[跳過] SKU {product['sku']} 已存在（詳情頁 SKU）")
+                scrape_status['skipped'] += 1
                 continue
             
             # 檢查成本價門檻
@@ -1193,7 +1233,9 @@ def run_scrape():
             result = upload_to_shopify(product, collection_id)
             if result['success']:
                 print(f"[成功] 上傳 SKU {product['sku']}")
-                existing_skus.add(product['sku'])  # 防止同一批次重複上架
+                # ★ 同時加入列表頁和詳情頁的 SKU，確保不重複
+                existing_skus.add(product['sku'])
+                existing_skus.add(item['sku'])
                 scrape_status['uploaded'] += 1
                 scrape_status['products'].append({
                     'sku': product['sku'],
@@ -1297,21 +1339,26 @@ def test_scrape():
             if 'shopdetail' in href and 'brandcode=' in href:
                 shopdetail_links.append(href)
         
-        # 去重（用 brandcode）
+        # 去重（用標準化的 brandcode）
         seen = set()
         unique_items = []
         for href in shopdetail_links:
             brandcode_match = re.search(r'brandcode=(\d+)', href)
             if brandcode_match:
-                brandcode = brandcode_match.group(1)
-                if brandcode not in seen:
-                    seen.add(brandcode)
-                    unique_items.append({'href': href, 'brandcode': brandcode})
+                brandcode_raw = brandcode_match.group(1)
+                brandcode_normalized = str(int(brandcode_raw))
+                if brandcode_normalized not in seen:
+                    seen.add(brandcode_normalized)
+                    unique_items.append({
+                        'href': href, 
+                        'brandcode_raw': brandcode_raw,
+                        'brandcode_normalized': brandcode_normalized,
+                        'sku': f"FGT-{brandcode_normalized}"
+                    })
         
         # 取前 3 個測試
         for item in unique_items[:3]:
-            brandcode = item['brandcode']
-            full_url = f"{BASE_URL}/shopdetail/{brandcode}/"
+            full_url = f"{BASE_URL}/shopdetail/{item['brandcode_raw']}/"
             
             product = scrape_product_detail(full_url)
             if product:
@@ -1323,7 +1370,7 @@ def test_scrape():
             'total_links': len(all_links),
             'shopdetail_links': len(shopdetail_links),
             'products': products,
-            'sample_links': [item['href'] for item in unique_items[:5]],
+            'sample_items': unique_items[:5],
             'html_sample': html_content[:3000]  # 回傳部分 HTML 供檢視
         })
         
@@ -1357,17 +1404,22 @@ def test_upload():
         # 找商品連結 - 格式: shopdetail.html?brandcode=000000000539
         product_links = soup.find_all('a', href=re.compile(r'shopdetail\.html\?brandcode='))
         
-        # 去重（用 brandcode）
+        # 去重（用標準化的 brandcode）
         seen = set()
         unique_items = []
         for link in product_links:
             href = link.get('href', '')
             brandcode_match = re.search(r'brandcode=(\d+)', href)
             if brandcode_match:
-                brandcode = brandcode_match.group(1)
-                if brandcode not in seen:
-                    seen.add(brandcode)
-                    unique_items.append({'href': href, 'brandcode': brandcode})
+                brandcode_raw = brandcode_match.group(1)
+                brandcode_normalized = str(int(brandcode_raw))
+                if brandcode_normalized not in seen:
+                    seen.add(brandcode_normalized)
+                    unique_items.append({
+                        'href': href, 
+                        'brandcode_raw': brandcode_raw,
+                        'brandcode_normalized': brandcode_normalized
+                    })
         
         if not unique_items:
             return jsonify({'error': '找不到商品連結'}), 400
@@ -1375,8 +1427,7 @@ def test_upload():
         # 找第一個價格 >= 1000 的商品
         product = None
         for item in unique_items:
-            brandcode = item['brandcode']
-            full_url = f"{BASE_URL}/shopdetail/{brandcode}/"
+            full_url = f"{BASE_URL}/shopdetail/{item['brandcode_raw']}/"
             
             p = scrape_product_detail(full_url)
             if p and p['price'] >= MIN_COST_THRESHOLD and p['in_stock']:

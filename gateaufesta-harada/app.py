@@ -1,10 +1,10 @@
 """
-神戶風月堂商品爬蟲 + Shopify 上架工具 (修正版)
+神戶風月堂商品爬蟲 + Shopify 上架工具 (修正版 v2.0)
 
 修正項目：
 1. 新增「標題重複檢查」- 避免翻譯後標題相同的商品重複上架
-2. 改進 SKU 標準化邏輯
-3. 新增上架前的雙重驗證
+2. 新增「重複商品診斷」頁面 - 可視化分析並一鍵刪除重複商品
+3. 改進 SKU 標準化邏輯
 """
 
 from flask import Flask, render_template, jsonify, request
@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from urllib.parse import urljoin, urlencode
+from collections import defaultdict
 import math
 
 # 處理 PyInstaller 打包後的路徑
@@ -72,8 +73,6 @@ def load_shopify_token():
             shop = data.get('shop', '')
             if shop:
                 SHOPIFY_SHOP = shop.replace('https://', '').replace('http://', '').replace('.myshopify.com', '').strip('/')
-            
-            print(f"[設定] 從檔案載入 - 商店: {SHOPIFY_SHOP}")
             return True
     print(f"[錯誤] 找不到設定")
     return False
@@ -89,6 +88,8 @@ def shopify_api_url(endpoint):
 
 def normalize_sku(sku_or_brandcode):
     """標準化 SKU 格式"""
+    if not sku_or_brandcode:
+        return ""
     if sku_or_brandcode.startswith('FGT-'):
         brandcode = sku_or_brandcode[4:]
     else:
@@ -101,33 +102,64 @@ def normalize_sku(sku_or_brandcode):
         return sku_or_brandcode
 
 def normalize_title(title):
-    """
-    標準化標題用於重複比對
-    移除空格、全形空格、標點符號差異
-    """
+    """標準化標題用於重複比對"""
     if not title:
         return ""
     
-    # 移除空格和常見的差異字符
     normalized = title.strip()
-    normalized = re.sub(r'\s+', '', normalized)  # 移除所有空格
-    normalized = normalized.replace('　', '')     # 移除全形空格
-    normalized = normalized.replace('・', '')     # 移除中點
+    normalized = re.sub(r'\s+', '', normalized)
+    normalized = normalized.replace('　', '')
+    normalized = normalized.replace('・', '')
     normalized = normalized.replace('‧', '')
     normalized = normalized.replace('·', '')
     normalized = normalized.lower()
     
     return normalized
 
+def get_all_products_detailed():
+    """取得所有商品的詳細資訊（用於診斷）"""
+    products = []
+    url = shopify_api_url("products.json?limit=250")
+    
+    while url:
+        response = requests.get(url, headers=get_shopify_headers())
+        if response.status_code != 200:
+            print(f"Error fetching products: {response.status_code}")
+            break
+        
+        data = response.json()
+        for p in data.get('products', []):
+            sku = ''
+            price = ''
+            cost = ''
+            for v in p.get('variants', []):
+                sku = v.get('sku', '')
+                price = v.get('price', '')
+                break
+            
+            products.append({
+                'id': p.get('id'),
+                'title': p.get('title', ''),
+                'handle': p.get('handle', ''),
+                'sku': sku,
+                'price': price,
+                'vendor': p.get('vendor', ''),
+                'status': p.get('status', ''),
+                'created_at': p.get('created_at', ''),
+                'image': p.get('image', {}).get('src', '') if p.get('image') else ''
+            })
+        
+        link_header = response.headers.get('Link', '')
+        if 'rel="next"' in link_header:
+            match = re.search(r'<([^>]+)>; rel="next"', link_header)
+            url = match.group(1) if match else None
+        else:
+            url = None
+    
+    return products
+
 def get_existing_products_full():
-    """
-    取得 Shopify 已存在的商品完整資訊
-    回傳: {
-        'by_sku': {normalized_sku: product_id},
-        'by_title': {normalized_title: product_id},
-        'by_handle': {handle: product_id}
-    }
-    """
+    """取得 Shopify 已存在的商品完整資訊"""
     result = {
         'by_sku': {},
         'by_title': {},
@@ -139,7 +171,6 @@ def get_existing_products_full():
     while url:
         response = requests.get(url, headers=get_shopify_headers())
         if response.status_code != 200:
-            print(f"Error fetching products: {response.status_code}")
             break
         
         data = response.json()
@@ -148,16 +179,13 @@ def get_existing_products_full():
             title = product.get('title', '')
             handle = product.get('handle', '')
             
-            # 記錄標題（標準化後）
             normalized_title = normalize_title(title)
             if normalized_title:
                 result['by_title'][normalized_title] = product_id
             
-            # 記錄 handle
             if handle:
                 result['by_handle'][handle] = product_id
             
-            # 記錄 SKU
             for variant in product.get('variants', []):
                 sku = variant.get('sku')
                 if sku and product_id:
@@ -166,7 +194,6 @@ def get_existing_products_full():
                     if sku != normalized:
                         result['by_sku'][sku] = product_id
         
-        # 處理分頁
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
             match = re.search(r'<([^>]+)>; rel="next"', link_header)
@@ -174,16 +201,13 @@ def get_existing_products_full():
         else:
             url = None
     
-    print(f"[INFO] 載入 Shopify 商品: {len(result['by_sku'])} SKU, {len(result['by_title'])} 標題")
     return result
 
 def get_existing_skus():
-    """向下相容的函數"""
     full_data = get_existing_products_full()
     return set(full_data['by_sku'].keys())
 
 def get_existing_products_map():
-    """向下相容的函數"""
     full_data = get_existing_products_full()
     return full_data['by_sku']
 
@@ -192,7 +216,6 @@ def get_collection_products_map(collection_id):
     products_map = {}
     
     if not collection_id:
-        print("[WARNING] 沒有 Collection ID，跳過")
         return products_map
     
     url = shopify_api_url(f"collections/{collection_id}/products.json?limit=250")
@@ -200,7 +223,6 @@ def get_collection_products_map(collection_id):
     while url:
         response = requests.get(url, headers=get_shopify_headers())
         if response.status_code != 200:
-            print(f"Error fetching collection products: {response.status_code}")
             break
         
         data = response.json()
@@ -219,7 +241,6 @@ def get_collection_products_map(collection_id):
         else:
             url = None
     
-    print(f"[INFO] Collection 內有 {len(products_map)} 個商品")
     return products_map
 
 def set_product_to_draft(product_id):
@@ -227,18 +248,16 @@ def set_product_to_draft(product_id):
     url = shopify_api_url(f"products/{product_id}.json")
     
     response = requests.put(url, headers=get_shopify_headers(), json={
-        "product": {
-            "id": product_id,
-            "status": "draft"
-        }
+        "product": {"id": product_id, "status": "draft"}
     })
     
-    if response.status_code == 200:
-        print(f"[設為草稿] Product ID: {product_id}")
-        return True
-    else:
-        print(f"[設為草稿失敗] Product ID: {product_id}, 錯誤: {response.status_code}")
-        return False
+    return response.status_code == 200
+
+def delete_product(product_id):
+    """刪除 Shopify 商品"""
+    url = shopify_api_url(f"products/{product_id}.json")
+    response = requests.delete(url, headers=get_shopify_headers())
+    return response.status_code == 200
 
 def calculate_selling_price(cost, weight):
     """計算售價"""
@@ -247,9 +266,7 @@ def calculate_selling_price(cost, weight):
     
     shipping_cost = weight * 1250 if weight else 0
     price = (cost + shipping_cost) / 0.7
-    price = round(price)
-    
-    return price
+    return round(price)
 
 def translate_with_chatgpt(title, description):
     """使用 ChatGPT 翻譯商品名稱和說明"""
@@ -269,15 +286,13 @@ def translate_with_chatgpt(title, description):
 注意：
 1. 這是日本神戶風月堂的高級法蘭酥、餅乾禮盒
 2. 【重要】商品名稱的開頭必須是「神戶風月堂」四個字
-3. 【重要】如果商品有不同的規格（如入數、重量），必須在標題中明確標示，例如「神戶風月堂 法蘭酥禮盒 12入」和「神戶風月堂 法蘭酥禮盒 24入」應該是不同的標題
+3. 【重要】如果商品有不同的規格（如入數、重量），必須在標題中明確標示
 4. ゴーフル 翻譯為「法蘭酥」
 5. プティーゴーフル 翻譯為「迷你法蘭酥」
 6. ミニゴーフル 翻譯為「小法蘭酥」
 7. 神戸ぶっせ 翻譯為「神戶布雪」
 8. レスポワール 翻譯為「雷斯波瓦」
-9. 翻譯要自然流暢，不要生硬
-10. SEO 內容要包含：神戶風月堂、日本、法蘭酥、伴手禮等關鍵字
-11. 只回傳 JSON，不要其他文字"""
+9. 只回傳 JSON，不要其他文字"""
 
     try:
         response = requests.post(
@@ -289,7 +304,7 @@ def translate_with_chatgpt(title, description):
             json={
                 "model": "gpt-4o-mini",
                 "messages": [
-                    {"role": "system", "content": "你是專業的日本商品翻譯和 SEO 專家。商品名稱開頭一定要加上品牌名「神戶風月堂」。不同規格的商品必須有不同的標題。"},
+                    {"role": "system", "content": "你是專業的日本商品翻譯和 SEO 專家。"},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0,
@@ -323,7 +338,6 @@ def translate_with_chatgpt(title, description):
                 'meta_description': translated.get('meta_description', '')
             }
         else:
-            print(f"[OpenAI 錯誤] {response.status_code}: {response.text}")
             return {
                 'success': False,
                 'title': f"神戶風月堂 {title}",
@@ -352,7 +366,7 @@ scrape_status = {
     "errors": [],
     "uploaded": 0,
     "skipped": 0,
-    "skipped_by_title": 0,  # 新增：因標題重複而跳過
+    "skipped_by_title": 0,
     "filtered_by_price": 0,
     "deleted": 0
 }
@@ -360,7 +374,6 @@ scrape_status = {
 def parse_dimension_weight(soup, page_text):
     """解析寸法和重量"""
     dimension = None
-    weight = None
     
     detail_txt = soup.select_one('.detailTxt')
     if detail_txt:
@@ -377,49 +390,24 @@ def parse_dimension_weight(soup, page_text):
                         d1 = float(size_match.group(1))
                         d2 = float(size_match.group(2))
                         d3 = float(size_match.group(3))
-                        volume_weight = (d1 * d2 * d3) / 6000
-                        volume_weight = round(volume_weight, 2)
-                        dimension = {
-                            "d1": d1, 
-                            "d2": d2, 
-                            "d3": d3, 
-                            "size_str": value,
-                            "volume_weight": volume_weight
-                        }
-                        print(f"[DEBUG] 尺寸: {d1} × {d2} × {d3} cm, 材積重量: {volume_weight} kg")
+                        volume_weight = round((d1 * d2 * d3) / 6000, 2)
+                        dimension = {"d1": d1, "d2": d2, "d3": d3, "volume_weight": volume_weight}
                     break
     
     if not dimension:
-        size_patterns = [
-            r'サイズ[^\d]*([\d.]+)\s*[×xX]\s*([\d.]+)\s*[×xX]\s*([\d.]+)\s*cm',
-            r'([\d.]+)\s*[×xX]\s*([\d.]+)\s*[×xX]\s*([\d.]+)\s*cm',
-        ]
-        
-        for pattern in size_patterns:
+        for pattern in [r'サイズ[^\d]*([\d.]+)\s*[×xX]\s*([\d.]+)\s*[×xX]\s*([\d.]+)\s*cm',
+                        r'([\d.]+)\s*[×xX]\s*([\d.]+)\s*[×xX]\s*([\d.]+)\s*cm']:
             size_match = re.search(pattern, page_text)
             if size_match:
                 d1 = float(size_match.group(1))
                 d2 = float(size_match.group(2))
                 d3 = float(size_match.group(3))
-                volume_weight = (d1 * d2 * d3) / 6000
-                volume_weight = round(volume_weight, 2)
-                dimension = {
-                    "d1": d1, 
-                    "d2": d2, 
-                    "d3": d3, 
-                    "volume_weight": volume_weight
-                }
+                volume_weight = round((d1 * d2 * d3) / 6000, 2)
+                dimension = {"d1": d1, "d2": d2, "d3": d3, "volume_weight": volume_weight}
                 break
     
-    final_weight = 0
-    if dimension:
-        final_weight = dimension['volume_weight']
-    
-    return {
-        "dimension": dimension,
-        "actual_weight": weight,
-        "final_weight": round(final_weight, 2)
-    }
+    final_weight = dimension['volume_weight'] if dimension else 0
+    return {"dimension": dimension, "final_weight": round(final_weight, 2)}
 
 def scrape_product_list():
     """爬取所有分頁的商品列表"""
@@ -441,26 +429,19 @@ def scrape_product_list():
             response.encoding = 'euc-jp'
             
             if response.status_code != 200:
-                print(f"[結束] 頁面不存在，狀態碼: {response.status_code}")
                 break
             
             soup = BeautifulSoup(response.text, 'html.parser')
             all_links = soup.find_all('a')
             
-            product_links = []
-            for link in all_links:
-                href = link.get('href', '')
-                if 'shopdetail' in href and 'brandcode=' in href:
-                    product_links.append(link)
+            product_links = [link for link in all_links 
+                           if 'shopdetail' in link.get('href', '') and 'brandcode=' in link.get('href', '')]
             
             new_count = 0
             seen_brandcodes = set()
             
             for link in product_links:
                 href = link.get('href', '')
-                if not href:
-                    continue
-                
                 sku_match = re.search(r'brandcode=(\d+)', href)
                 
                 if sku_match:
@@ -487,14 +468,12 @@ def scrape_product_list():
             print(f"[進度] 新增 {new_count} 個商品，累計 {len(products)} 個")
             
             if new_count == 0:
-                print(f"[結束] 沒有新商品")
                 break
             
             next_page = soup.find('a', href=re.compile(rf'page={page + 1}'))
             if not next_page:
                 next_link = soup.find('a', string=re.compile(r'次|next', re.IGNORECASE))
                 if not next_link:
-                    print(f"[結束] 沒有下一頁")
                     break
             
             page += 1
@@ -502,11 +481,8 @@ def scrape_product_list():
             
         except Exception as e:
             print(f"[錯誤] 爬取失敗: {e}")
-            import traceback
-            traceback.print_exc()
             break
     
-    print(f"[完成] 共找到 {len(products)} 個商品")
     return products
 
 def scrape_product_detail(url):
@@ -516,7 +492,6 @@ def scrape_product_detail(url):
         response.encoding = 'euc-jp'
         
         if response.status_code != 200:
-            print(f"[錯誤] 狀態碼: {response.status_code} - {url}")
             return None
         
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -527,7 +502,6 @@ def scrape_product_detail(url):
         title_elem = soup.select_one('#itemInfo h2')
         if title_elem:
             title = title_elem.get_text(strip=True)
-        
         if not title:
             og_title = soup.find('meta', property='og:title')
             if og_title:
@@ -538,15 +512,7 @@ def scrape_product_detail(url):
         desc_elem = soup.select_one('.detailTxt')
         if desc_elem:
             first_p = desc_elem.find('p')
-            if first_p:
-                description = first_p.get_text(strip=True)
-            else:
-                description = desc_elem.get_text(strip=True)[:500]
-        
-        if not description:
-            og_desc = soup.find('meta', property='og:description')
-            if og_desc:
-                description = og_desc.get('content', '')[:500]
+            description = first_p.get_text(strip=True) if first_p else desc_elem.get_text(strip=True)[:500]
         
         # 價格
         price = 0
@@ -556,7 +522,6 @@ def scrape_product_detail(url):
                 price = int(price_meta.get('content', '0'))
             except:
                 pass
-        
         if not price:
             price_match = re.search(r'税込\s*([\d,]+)\s*円', page_text)
             if price_match:
@@ -566,25 +531,11 @@ def scrape_product_detail(url):
         sku = ""
         brandcode_match = re.search(r'/shopdetail/(\d+)/', url)
         if brandcode_match:
-            brandcode_raw = brandcode_match.group(1)
-            brandcode_normalized = str(int(brandcode_raw))
+            brandcode_normalized = str(int(brandcode_match.group(1)))
             sku = f"FGT-{brandcode_normalized}"
-        else:
-            code_match = re.search(r'商品コード\s*[：:]\s*(\d+)', page_text)
-            if code_match:
-                brandcode_raw = code_match.group(1)
-                brandcode_normalized = str(int(brandcode_raw))
-                sku = f"FGT-{brandcode_normalized}"
         
         # 庫存狀態
-        in_stock = True
-        if '在庫がありません' in page_text or '在庫切れ' in page_text or '品切れ' in page_text or 'SOLD OUT' in page_text:
-            in_stock = False
-        
-        stock_match = re.search(r'残りあと(\d+)個', page_text)
-        if stock_match:
-            stock_count = int(stock_match.group(1))
-            in_stock = stock_count > 0
+        in_stock = not any(kw in page_text for kw in ['在庫がありません', '在庫切れ', '品切れ', 'SOLD OUT'])
         
         # 重量
         weight_info = parse_dimension_weight(soup, page_text)
@@ -593,17 +544,15 @@ def scrape_product_detail(url):
         images = []
         seen_images = set()
         
-        main_images = soup.select('.M_imageMain img')
-        for img in main_images:
+        for img in soup.select('.M_imageMain img'):
             src = img.get('src', '')
             if src and 'noimage' not in src.lower():
-                full_src = src.replace('/s1_', '/1_').replace('/s2_', '/2_').replace('/s3_', '/3_').replace('/s4_', '/4_').replace('/s5_', '/5_').replace('/s6_', '/6_')
+                full_src = re.sub(r'/s(\d)_', r'/\1_', src)
                 if full_src not in seen_images:
                     seen_images.add(full_src)
                     images.append(full_src)
         
-        thumb_images = soup.select('.M_imageCatalog img')
-        for img in thumb_images:
+        for img in soup.select('.M_imageCatalog img'):
             src = img.get('src', '')
             if src and 'noimage' not in src.lower():
                 full_src = re.sub(r'/s(\d)_', r'/\1_', src)
@@ -613,21 +562,8 @@ def scrape_product_detail(url):
         
         if not images:
             og_image = soup.find('meta', property='og:image')
-            if og_image:
-                img_url = og_image.get('content', '')
-                if img_url:
-                    images.append(img_url)
-        
-        # 規格資訊
-        specs = {}
-        
-        content_match = re.search(r'内容量[^\d]*?([\w\d]+(?:個|枚|入|g|kg|本|缶))', page_text)
-        if content_match:
-            specs['content'] = content_match.group(1).strip()
-        
-        expiry_match = re.search(r'賞味期[間限][^\d]*?(?:出荷日より)?約?(\d+日?)', page_text)
-        if expiry_match:
-            specs['expiry'] = expiry_match.group(1).strip()
+            if og_image and og_image.get('content'):
+                images.append(og_image.get('content'))
         
         return {
             'url': url,
@@ -637,15 +573,11 @@ def scrape_product_detail(url):
             'in_stock': in_stock,
             'description': description,
             'weight': weight_info['final_weight'],
-            'weight_info': weight_info,
-            'images': images[:10],
-            'specs': specs
+            'images': images[:10]
         }
         
     except Exception as e:
         print(f"[錯誤] 爬取商品失敗 {url}: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 def get_or_create_collection(collection_title="神戶風月堂"):
@@ -664,12 +596,7 @@ def get_or_create_collection(collection_title="神戶風月堂"):
     response = requests.post(
         shopify_api_url('custom_collections.json'),
         headers=get_shopify_headers(),
-        json={
-            'custom_collection': {
-                'title': collection_title,
-                'published': True
-            }
-        }
+        json={'custom_collection': {'title': collection_title, 'published': True}}
     )
     
     if response.status_code == 201:
@@ -682,36 +609,16 @@ def add_product_to_collection(product_id, collection_id):
     response = requests.post(
         shopify_api_url('collects.json'),
         headers=get_shopify_headers(),
-        json={
-            'collect': {
-                'product_id': product_id,
-                'collection_id': collection_id
-            }
-        }
+        json={'collect': {'product_id': product_id, 'collection_id': collection_id}}
     )
     return response.status_code == 201
 
 def publish_to_all_channels(product_id):
     """發布到所有銷售渠道"""
     graphql_url = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/graphql.json"
-    headers = {
-        'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
-        'Content-Type': 'application/json',
-    }
+    headers = {'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json'}
     
-    query = """
-    {
-      publications(first: 20) {
-        edges {
-          node {
-            id
-            name
-          }
-        }
-      }
-    }
-    """
-    
+    query = """{ publications(first: 20) { edges { node { id name } } } }"""
     response = requests.post(graphql_url, headers=headers, json={'query': query})
     
     if response.status_code != 200:
@@ -728,81 +635,41 @@ def publish_to_all_channels(product_id):
             seen_names.add(name)
             unique_publications.append(pub['node'])
     
-    publication_inputs = [{"publicationId": pub['id']} for pub in unique_publications]
-    
     mutation = """
     mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
       publishablePublish(id: $id, input: $input) {
-        publishable {
-          availablePublicationsCount {
-            count
-          }
-        }
-        userErrors {
-          field
-          message
-        }
+        userErrors { field message }
       }
     }
     """
     
     variables = {
         "id": f"gid://shopify/Product/{product_id}",
-        "input": publication_inputs
+        "input": [{"publicationId": pub['id']} for pub in unique_publications]
     }
     
-    requests.post(graphql_url, headers=headers, json={
-        'query': mutation,
-        'variables': variables
-    })
-    
+    requests.post(graphql_url, headers=headers, json={'query': mutation, 'variables': variables})
     return True
 
 def upload_to_shopify(product, collection_id=None, existing_titles=None):
-    """
-    上傳商品到 Shopify
+    """上傳商品到 Shopify"""
     
-    新增參數:
-    - existing_titles: 已存在的標題集合（標準化後），用於檢查重複
-    """
-    
-    # 翻譯商品名稱和說明
     print(f"[翻譯] 正在翻譯: {product['title'][:30]}...")
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
     
-    if translated['success']:
-        print(f"[翻譯成功] {translated['title'][:30]}...")
-    else:
-        print(f"[翻譯失敗] 使用原文")
-    
-    # ★★★ 新增：檢查翻譯後的標題是否重複 ★★★
+    # 檢查標題重複
     if existing_titles is not None:
         normalized_new_title = normalize_title(translated['title'])
         if normalized_new_title in existing_titles:
-            print(f"[跳過-標題重複] '{translated['title']}' 已存在於 Shopify")
-            return {
-                'success': False, 
-                'error': 'title_duplicate',
-                'translated': translated,
-                'duplicate_title': translated['title']
-            }
+            print(f"[跳過-標題重複] '{translated['title']}'")
+            return {'success': False, 'error': 'title_duplicate', 'translated': translated}
     
-    # 計算售價
     cost = product['price']
     weight = product.get('weight', 0)
     selling_price = calculate_selling_price(cost, weight)
     
-    print(f"[價格計算] 進貨價: ¥{cost}, 重量: {weight}kg, 售價: ¥{selling_price}")
+    images = [{'src': img_url, 'position': idx + 1} for idx, img_url in enumerate(product.get('images', []))]
     
-    # 準備圖片資料
-    images = []
-    for idx, img_url in enumerate(product.get('images', [])):
-        images.append({
-            'src': img_url,
-            'position': idx + 1
-        })
-    
-    # 建立商品資料
     shopify_product = {
         'product': {
             'title': translated['title'],
@@ -814,7 +681,7 @@ def upload_to_shopify(product, collection_id=None, existing_titles=None):
             'variants': [{
                 'sku': product['sku'],
                 'price': f"{selling_price:.2f}",
-                'weight': product.get('weight', 0),
+                'weight': weight,
                 'weight_unit': 'kg',
                 'inventory_management': None,
                 'inventory_policy': 'continue',
@@ -824,38 +691,21 @@ def upload_to_shopify(product, collection_id=None, existing_titles=None):
             'tags': '神戶風月堂, 日本, 法蘭酥, ゴーフル, 伴手禮, 日本零食, 神戶',
             'metafields_global_title_tag': translated['page_title'],
             'metafields_global_description_tag': translated['meta_description'],
-            'metafields': [
-                {
-                    'namespace': 'custom',
-                    'key': 'link',
-                    'value': product['url'],
-                    'type': 'url'
-                }
-            ]
+            'metafields': [{'namespace': 'custom', 'key': 'link', 'value': product['url'], 'type': 'url'}]
         }
     }
     
-    response = requests.post(
-        shopify_api_url('products.json'),
-        headers=get_shopify_headers(),
-        json=shopify_product
-    )
+    response = requests.post(shopify_api_url('products.json'), headers=get_shopify_headers(), json=shopify_product)
     
     if response.status_code == 201:
         created_product = response.json()['product']
         product_id = created_product['id']
         variant_id = created_product['variants'][0]['id']
         
-        # 更新 cost
         requests.put(
             shopify_api_url(f'variants/{variant_id}.json'),
             headers=get_shopify_headers(),
-            json={
-                'variant': {
-                    'id': variant_id,
-                    'cost': f"{cost:.2f}"
-                }
-            }
+            json={'variant': {'id': variant_id, 'cost': f"{cost:.2f}"}}
         )
         
         if collection_id:
@@ -863,15 +713,8 @@ def upload_to_shopify(product, collection_id=None, existing_titles=None):
         
         publish_to_all_channels(product_id)
         
-        return {
-            'success': True, 
-            'product': created_product, 
-            'translated': translated, 
-            'selling_price': selling_price, 
-            'cost': cost
-        }
+        return {'success': True, 'product': created_product, 'translated': translated, 'selling_price': selling_price, 'cost': cost}
     else:
-        print(f"[ERROR] Shopify 錯誤: {response.text}")
         return {'success': False, 'error': response.text}
 
 # ========== Flask 路由 ==========
@@ -880,24 +723,29 @@ def upload_to_shopify(product, collection_id=None, existing_titles=None):
 def index():
     """首頁"""
     token_loaded = load_shopify_token()
-    token_status = '<span style="color: green;">✓ 已載入</span>' if token_loaded else '<span style="color: red;">✗ 未設定</span>'
+    token_status = '✓ 已載入' if token_loaded else '✗ 未設定'
+    token_color = 'green' if token_loaded else 'red'
     
     return f'''<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>神戶風月堂 爬蟲工具 (修正版)</title>
+    <title>神戶風月堂 爬蟲工具</title>
     <style>
         * {{ box-sizing: border-box; }}
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f5f5; }}
         h1 {{ color: #333; border-bottom: 2px solid #8B4513; padding-bottom: 10px; }}
         .card {{ background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        .btn {{ background: #8B4513; color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-right: 10px; }}
+        .btn {{ background: #8B4513; color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-right: 10px; margin-bottom: 10px; text-decoration: none; display: inline-block; }}
         .btn:hover {{ background: #6B3510; }}
         .btn:disabled {{ background: #ccc; cursor: not-allowed; }}
         .btn-secondary {{ background: #3498db; }}
         .btn-secondary:hover {{ background: #2980b9; }}
+        .btn-danger {{ background: #e74c3c; }}
+        .btn-danger:hover {{ background: #c0392b; }}
+        .btn-warning {{ background: #f39c12; }}
+        .btn-warning:hover {{ background: #d68910; }}
         .progress-bar {{ width: 100%; height: 20px; background: #eee; border-radius: 10px; overflow: hidden; margin: 10px 0; }}
         .progress-fill {{ height: 100%; background: linear-gradient(90deg, #8B4513, #D2691E); transition: width 0.3s; }}
         .status {{ padding: 10px; background: #f8f9fa; border-radius: 5px; margin-top: 10px; }}
@@ -906,16 +754,24 @@ def index():
         .stat {{ flex: 1; min-width: 80px; text-align: center; padding: 15px; background: #f8f9fa; border-radius: 5px; }}
         .stat-number {{ font-size: 24px; font-weight: bold; color: #8B4513; }}
         .stat-label {{ font-size: 11px; color: #666; margin-top: 5px; }}
-        .version {{ color: #999; font-size: 12px; }}
+        .nav {{ margin-bottom: 20px; }}
+        .nav a {{ margin-right: 15px; color: #8B4513; text-decoration: none; font-weight: bold; }}
+        .nav a:hover {{ text-decoration: underline; }}
     </style>
 </head>
 <body>
-    <h1>🍪 神戶風月堂 爬蟲工具 <span class="version">(修正版 v2.0)</span></h1>
+    <div class="nav">
+        <a href="/">🏠 首頁</a>
+        <a href="/diagnose">🔍 重複診斷</a>
+    </div>
+    
+    <h1>🍪 神戶風月堂 爬蟲工具 <small style="font-size: 14px; color: #999;">v2.0</small></h1>
     
     <div class="card">
         <h3>Shopify 連線狀態</h3>
-        <p>Token: {token_status}</p>
+        <p>Token: <span style="color: {token_color};">{token_status}</span></p>
         <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
+        <a href="/diagnose" class="btn btn-warning">🔍 檢查重複商品</a>
     </div>
     
     <div class="card">
@@ -923,7 +779,7 @@ def index():
         <p>爬取 shop.fugetsudo-kobe.jp 全站商品並上架到 Shopify</p>
         <p style="color: #666; font-size: 14px;">
             ※ 成本價低於 ¥1000 的商品將自動跳過<br>
-            ※ <b style="color: #e74c3c;">新增：標題重複檢查</b> - 避免相同名稱的商品重複上架
+            ※ <b style="color: #27ae60;">新增：標題重複檢查</b> - 避免相同名稱的商品重複上架
         </p>
         <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
         
@@ -955,7 +811,7 @@ def index():
                     <div class="stat-label">設為草稿</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number" id="errorCount">0</div>
+                    <div class="stat-number" id="errorCount" style="color: #e74c3c;">0</div>
                     <div class="stat-label">錯誤</div>
                 </div>
             </div>
@@ -973,7 +829,8 @@ def index():
         function log(msg, type = '') {{
             const logArea = document.getElementById('logArea');
             const time = new Date().toLocaleTimeString();
-            const color = type === 'success' ? '#4ec9b0' : type === 'error' ? '#f14c4c' : type === 'warning' ? '#dcdcaa' : '#d4d4d4';
+            const colors = {{ success: '#4ec9b0', error: '#f14c4c', warning: '#dcdcaa' }};
+            const color = colors[type] || '#d4d4d4';
             logArea.innerHTML += '<div style="color:' + color + '">[' + time + '] ' + msg + '</div>';
             logArea.scrollTop = logArea.scrollHeight;
         }}
@@ -1037,7 +894,6 @@ def index():
                     clearInterval(pollInterval);
                     document.getElementById('startBtn').disabled = false;
                     log('========== 爬取完成 ==========', 'success');
-                    log('上架: ' + data.uploaded + ' | SKU重複: ' + data.skipped + ' | 標題重複: ' + (data.skipped_by_title || 0) + ' | 價格過濾: ' + (data.filtered_by_price || 0));
                 }}
             }} catch (e) {{
                 console.error('Poll error:', e);
@@ -1046,6 +902,320 @@ def index():
     </script>
 </body>
 </html>'''
+
+@app.route('/diagnose')
+def diagnose_page():
+    """重複商品診斷頁面"""
+    return '''<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>重複商品診斷 - 神戶風月堂</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        h1 { color: #333; border-bottom: 2px solid #e74c3c; padding-bottom: 10px; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .btn { background: #8B4513; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; margin-bottom: 10px; }
+        .btn:hover { background: #6B3510; }
+        .btn:disabled { background: #ccc; cursor: not-allowed; }
+        .btn-danger { background: #e74c3c; }
+        .btn-danger:hover { background: #c0392b; }
+        .btn-secondary { background: #3498db; }
+        .btn-sm { padding: 5px 10px; font-size: 12px; }
+        .nav { margin-bottom: 20px; }
+        .nav a { margin-right: 15px; color: #8B4513; text-decoration: none; font-weight: bold; }
+        .stats { display: flex; gap: 15px; margin: 20px 0; flex-wrap: wrap; }
+        .stat { flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f8f9fa; border-radius: 8px; }
+        .stat-number { font-size: 36px; font-weight: bold; }
+        .stat-label { font-size: 14px; color: #666; margin-top: 5px; }
+        .duplicate-group { border: 1px solid #e74c3c; border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
+        .duplicate-header { background: #fee; padding: 15px; border-bottom: 1px solid #e74c3c; display: flex; justify-content: space-between; align-items: center; }
+        .duplicate-header h4 { margin: 0; color: #c0392b; }
+        .duplicate-items { padding: 0; }
+        .duplicate-item { display: flex; align-items: center; padding: 12px 15px; border-bottom: 1px solid #eee; gap: 15px; }
+        .duplicate-item:last-child { border-bottom: none; }
+        .duplicate-item.keep { background: #e8f5e9; }
+        .duplicate-item.delete { background: #ffebee; }
+        .duplicate-item img { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; }
+        .duplicate-item .info { flex: 1; }
+        .duplicate-item .info .title { font-weight: bold; margin-bottom: 5px; }
+        .duplicate-item .info .meta { font-size: 12px; color: #666; }
+        .duplicate-item .actions { display: flex; gap: 5px; }
+        .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; }
+        .badge-keep { background: #27ae60; color: white; }
+        .badge-delete { background: #e74c3c; color: white; }
+        .loading { text-align: center; padding: 40px; color: #666; }
+        .checkbox-label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+        #results { margin-top: 20px; }
+        .action-bar { position: sticky; top: 0; background: white; padding: 15px; margin: -20px -20px 20px -20px; border-bottom: 1px solid #ddd; z-index: 100; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+        .no-image { width: 60px; height: 60px; background: #eee; display: flex; align-items: center; justify-content: center; border-radius: 4px; color: #999; font-size: 10px; }
+    </style>
+</head>
+<body>
+    <div class="nav">
+        <a href="/">🏠 首頁</a>
+        <a href="/diagnose">🔍 重複診斷</a>
+    </div>
+    
+    <h1>🔍 重複商品診斷</h1>
+    
+    <div class="card">
+        <p>掃描 Shopify 商店中的重複商品（相同標題），並提供一鍵清理功能。</p>
+        <button class="btn" id="scanBtn" onclick="startScan()">🔍 開始掃描</button>
+        <span id="scanStatus"></span>
+    </div>
+    
+    <div class="stats" id="statsSection" style="display: none;">
+        <div class="stat">
+            <div class="stat-number" id="totalProducts" style="color: #3498db;">0</div>
+            <div class="stat-label">總商品數</div>
+        </div>
+        <div class="stat">
+            <div class="stat-number" id="duplicateGroups" style="color: #e74c3c;">0</div>
+            <div class="stat-label">重複群組</div>
+        </div>
+        <div class="stat">
+            <div class="stat-number" id="duplicateCount" style="color: #e67e22;">0</div>
+            <div class="stat-label">建議刪除</div>
+        </div>
+    </div>
+    
+    <div class="card" id="resultsCard" style="display: none;">
+        <div class="action-bar">
+            <div>
+                <button class="btn btn-danger" id="deleteSelectedBtn" onclick="deleteSelected()" disabled>🗑️ 刪除選中的商品</button>
+                <button class="btn btn-secondary" onclick="selectAllToDelete()">全選建議刪除</button>
+                <button class="btn btn-secondary" onclick="deselectAll()">取消全選</button>
+            </div>
+            <div id="selectedCount">已選擇: 0 個</div>
+        </div>
+        <div id="results"></div>
+    </div>
+
+    <script>
+        let duplicateData = [];
+        let selectedIds = new Set();
+        
+        async function startScan() {
+            document.getElementById('scanBtn').disabled = true;
+            document.getElementById('scanStatus').textContent = '掃描中...';
+            document.getElementById('statsSection').style.display = 'none';
+            document.getElementById('resultsCard').style.display = 'none';
+            
+            try {
+                const res = await fetch('/api/diagnose');
+                const data = await res.json();
+                
+                if (data.error) {
+                    alert('錯誤: ' + data.error);
+                    return;
+                }
+                
+                duplicateData = data.duplicates;
+                
+                // 更新統計
+                document.getElementById('totalProducts').textContent = data.total_products;
+                document.getElementById('duplicateGroups').textContent = data.duplicate_groups;
+                document.getElementById('duplicateCount').textContent = data.to_delete_count;
+                document.getElementById('statsSection').style.display = 'flex';
+                
+                // 渲染結果
+                renderResults(data.duplicates);
+                
+                document.getElementById('resultsCard').style.display = 'block';
+                document.getElementById('scanStatus').textContent = '掃描完成！';
+                
+            } catch (e) {
+                alert('請求失敗: ' + e.message);
+            } finally {
+                document.getElementById('scanBtn').disabled = false;
+            }
+        }
+        
+        function renderResults(duplicates) {
+            const container = document.getElementById('results');
+            
+            if (duplicates.length === 0) {
+                container.innerHTML = '<p style="text-align: center; color: #27ae60; font-size: 18px;">✅ 太棒了！沒有發現重複商品。</p>';
+                return;
+            }
+            
+            let html = '';
+            
+            duplicates.forEach((group, groupIndex) => {
+                html += `<div class="duplicate-group">
+                    <div class="duplicate-header">
+                        <h4>📦 ${group.title} <span style="font-weight: normal; font-size: 14px;">(${group.items.length} 個重複)</span></h4>
+                    </div>
+                    <div class="duplicate-items">`;
+                
+                group.items.forEach((item, itemIndex) => {
+                    const isKeep = itemIndex === 0;
+                    const badgeClass = isKeep ? 'badge-keep' : 'badge-delete';
+                    const badgeText = isKeep ? '保留' : '建議刪除';
+                    const rowClass = isKeep ? 'keep' : 'delete';
+                    const imageHtml = item.image 
+                        ? `<img src="${item.image}" alt="${item.title}">`
+                        : `<div class="no-image">無圖片</div>`;
+                    
+                    html += `<div class="duplicate-item ${rowClass}">
+                        ${!isKeep ? `<label class="checkbox-label">
+                            <input type="checkbox" class="delete-checkbox" data-id="${item.id}" onchange="updateSelection()">
+                        </label>` : '<div style="width: 20px;"></div>'}
+                        ${imageHtml}
+                        <div class="info">
+                            <div class="title">${item.title}</div>
+                            <div class="meta">
+                                SKU: ${item.sku || '無'} | 
+                                Handle: ${item.handle} | 
+                                價格: $${item.price} |
+                                建立: ${new Date(item.created_at).toLocaleDateString('zh-TW')}
+                            </div>
+                        </div>
+                        <span class="badge ${badgeClass}">${badgeText}</span>
+                        <div class="actions">
+                            <a href="https://${window.location.hostname.includes('localhost') ? 'your-shop' : '${SHOPIFY_SHOP}'}.myshopify.com/admin/products/${item.id}" target="_blank" class="btn btn-secondary btn-sm">查看</a>
+                        </div>
+                    </div>`;
+                });
+                
+                html += '</div></div>';
+            });
+            
+            container.innerHTML = html;
+        }
+        
+        function updateSelection() {
+            selectedIds.clear();
+            document.querySelectorAll('.delete-checkbox:checked').forEach(cb => {
+                selectedIds.add(cb.dataset.id);
+            });
+            document.getElementById('selectedCount').textContent = `已選擇: ${selectedIds.size} 個`;
+            document.getElementById('deleteSelectedBtn').disabled = selectedIds.size === 0;
+        }
+        
+        function selectAllToDelete() {
+            document.querySelectorAll('.delete-checkbox').forEach(cb => {
+                cb.checked = true;
+            });
+            updateSelection();
+        }
+        
+        function deselectAll() {
+            document.querySelectorAll('.delete-checkbox').forEach(cb => {
+                cb.checked = false;
+            });
+            updateSelection();
+        }
+        
+        async function deleteSelected() {
+            if (selectedIds.size === 0) return;
+            
+            if (!confirm(`確定要刪除 ${selectedIds.size} 個商品嗎？此操作無法復原！`)) {
+                return;
+            }
+            
+            const btn = document.getElementById('deleteSelectedBtn');
+            btn.disabled = true;
+            btn.textContent = '刪除中...';
+            
+            const ids = Array.from(selectedIds);
+            let successCount = 0;
+            let failCount = 0;
+            
+            for (const id of ids) {
+                try {
+                    const res = await fetch('/api/delete-product', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ product_id: id })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        successCount++;
+                        // 從畫面移除
+                        const checkbox = document.querySelector(`.delete-checkbox[data-id="${id}"]`);
+                        if (checkbox) {
+                            checkbox.closest('.duplicate-item').remove();
+                        }
+                    } else {
+                        failCount++;
+                    }
+                } catch (e) {
+                    failCount++;
+                }
+            }
+            
+            alert(`刪除完成！\\n成功: ${successCount} 個\\n失敗: ${failCount} 個`);
+            
+            selectedIds.clear();
+            updateSelection();
+            btn.textContent = '🗑️ 刪除選中的商品';
+            
+            // 重新掃描
+            startScan();
+        }
+    </script>
+</body>
+</html>'''
+
+@app.route('/api/diagnose')
+def api_diagnose():
+    """診斷重複商品 API"""
+    if not load_shopify_token():
+        return jsonify({'error': '未設定 Shopify Token'}), 400
+    
+    products = get_all_products_detailed()
+    
+    # 按標題分組
+    by_title = defaultdict(list)
+    for p in products:
+        title = p.get('title', '')
+        if title:
+            by_title[title].append(p)
+    
+    # 找出重複的
+    duplicates = []
+    to_delete_count = 0
+    
+    for title, items in by_title.items():
+        if len(items) > 1:
+            # 按建立時間排序，最早的保留
+            sorted_items = sorted(items, key=lambda x: x['created_at'])
+            duplicates.append({
+                'title': title,
+                'count': len(items),
+                'items': sorted_items
+            })
+            to_delete_count += len(items) - 1
+    
+    # 按重複數量排序
+    duplicates.sort(key=lambda x: -x['count'])
+    
+    return jsonify({
+        'total_products': len(products),
+        'duplicate_groups': len(duplicates),
+        'to_delete_count': to_delete_count,
+        'duplicates': duplicates
+    })
+
+@app.route('/api/delete-product', methods=['POST'])
+def api_delete_product():
+    """刪除單一商品 API"""
+    if not load_shopify_token():
+        return jsonify({'error': '未設定 Shopify Token'}), 400
+    
+    data = request.get_json()
+    product_id = data.get('product_id')
+    
+    if not product_id:
+        return jsonify({'error': '缺少 product_id'}), 400
+    
+    success = delete_product(product_id)
+    
+    return jsonify({'success': success, 'product_id': product_id})
 
 @app.route('/api/status')
 def get_status():
@@ -1059,22 +1229,16 @@ def start_scrape():
         return jsonify({'error': '爬取已在進行中'}), 400
     
     scrape_status = {
-        "running": True,
-        "progress": 0,
-        "total": 0,
+        "running": True, "progress": 0, "total": 0,
         "current_product": "正在取得商品列表...",
-        "products": [],
-        "errors": [],
-        "uploaded": 0,
-        "skipped": 0,
-        "skipped_by_title": 0,
-        "filtered_by_price": 0,
-        "deleted": 0
+        "products": [], "errors": [],
+        "uploaded": 0, "skipped": 0, "skipped_by_title": 0,
+        "filtered_by_price": 0, "deleted": 0
     }
     
     if not load_shopify_token():
         scrape_status['running'] = False
-        return jsonify({'error': '請先完成 Shopify OAuth 授權'}), 400
+        return jsonify({'error': '請先設定 Shopify Token'}), 400
     
     import threading
     thread = threading.Thread(target=run_scrape)
@@ -1083,42 +1247,33 @@ def start_scrape():
     return jsonify({'message': '開始爬取'})
 
 def run_scrape():
-    """執行爬取流程 - 修正版"""
+    """執行爬取流程"""
     global scrape_status
     
     try:
-        # 1. 取得 Shopify 所有商品（包含標題）
         scrape_status['current_product'] = "正在檢查 Shopify 已有商品..."
         existing_data = get_existing_products_full()
         existing_skus = set(existing_data['by_sku'].keys())
-        existing_titles = set(existing_data['by_title'].keys())  # ★ 新增：標題集合
+        existing_titles = set(existing_data['by_title'].keys())
         
-        print(f"[INFO] Shopify 已有 {len(existing_skus)} 個 SKU, {len(existing_titles)} 個不同標題")
-        
-        # 2. 取得或建立 Collection
         scrape_status['current_product'] = "正在設定 Collection..."
         collection_id = get_or_create_collection("神戶風月堂")
         
-        # 3. 取得 Collection 內的商品
         scrape_status['current_product'] = "正在取得 Collection 內商品..."
         collection_products_map = get_collection_products_map(collection_id)
         collection_skus = set(collection_products_map.keys())
         
-        # 4. 爬取商品列表
         scrape_status['current_product'] = "正在爬取商品列表..."
         product_list = scrape_product_list()
         scrape_status['total'] = len(product_list)
         
         website_skus = set(item['sku'] for item in product_list)
         
-        # 5. 爬取每個商品詳情並上傳
         for idx, item in enumerate(product_list):
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理: {item['sku']}"
             
-            # 檢查 SKU 是否已存在
             if item['sku'] in existing_skus:
-                print(f"[跳過] SKU {item['sku']} 已存在")
                 scrape_status['skipped'] += 1
                 continue
             
@@ -1128,74 +1283,43 @@ def run_scrape():
                 continue
             
             if product['sku'] in existing_skus:
-                print(f"[跳過] SKU {product['sku']} 已存在（詳情頁）")
                 scrape_status['skipped'] += 1
                 continue
             
-            # 檢查成本價門檻
             if product['price'] < MIN_COST_THRESHOLD:
-                print(f"[跳過] SKU {product['sku']} 成本價 ¥{product['price']} 低於門檻")
                 scrape_status['filtered_by_price'] += 1
                 continue
             
             if not product['in_stock']:
-                print(f"[跳過] SKU {product['sku']} 無庫存")
                 scrape_status['skipped'] += 1
                 continue
             
-            # ★ 上傳時傳入 existing_titles 進行標題重複檢查
             result = upload_to_shopify(product, collection_id, existing_titles)
             
             if result['success']:
-                print(f"[成功] 上傳 SKU {product['sku']}")
                 existing_skus.add(product['sku'])
-                existing_skus.add(item['sku'])
-                
-                # ★ 將新標題加入已存在集合
                 new_title = result.get('translated', {}).get('title', '')
                 if new_title:
                     existing_titles.add(normalize_title(new_title))
-                
                 scrape_status['uploaded'] += 1
-                scrape_status['products'].append({
-                    'sku': product['sku'],
-                    'title': result.get('translated', {}).get('title', product['title']),
-                    'status': 'success'
-                })
             elif result.get('error') == 'title_duplicate':
-                # ★ 標題重複
-                print(f"[跳過-標題重複] {result.get('duplicate_title', '')}")
                 scrape_status['skipped_by_title'] += 1
-                scrape_status['products'].append({
-                    'sku': product['sku'],
-                    'title': result.get('duplicate_title', ''),
-                    'status': 'title_duplicate'
-                })
             else:
-                print(f"[失敗] SKU {product['sku']}: {result['error']}")
-                scrape_status['errors'].append(f"上傳失敗 {product['sku']}: {result['error']}")
+                scrape_status['errors'].append(f"上傳失敗 {product['sku']}")
             
             time.sleep(1)
         
-        # 6. 設為草稿
+        # 設為草稿
         scrape_status['current_product'] = "正在檢查已下架商品..."
         skus_to_draft = collection_skus - website_skus
         
-        if skus_to_draft:
-            print(f"[INFO] 發現 {len(skus_to_draft)} 個商品需要設為草稿")
-            
-            for sku in skus_to_draft:
-                scrape_status['current_product'] = f"設為草稿: {sku}"
-                product_id = collection_products_map.get(sku)
-                
-                if product_id:
-                    if set_product_to_draft(product_id):
-                        scrape_status['deleted'] += 1
-                    
-                    time.sleep(0.5)
+        for sku in skus_to_draft:
+            product_id = collection_products_map.get(sku)
+            if product_id and set_product_to_draft(product_id):
+                scrape_status['deleted'] += 1
+            time.sleep(0.3)
         
     except Exception as e:
-        print(f"[錯誤] {e}")
         scrape_status['errors'].append(str(e))
     
     finally:
@@ -1207,10 +1331,7 @@ def test_shopify():
     if not load_shopify_token():
         return jsonify({'error': '未找到 Token'}), 400
     
-    response = requests.get(
-        shopify_api_url('shop.json'),
-        headers=get_shopify_headers()
-    )
+    response = requests.get(shopify_api_url('shop.json'), headers=get_shopify_headers())
     
     if response.status_code == 200:
         return jsonify({'success': True, 'shop': response.json()['shop']})
@@ -1219,12 +1340,9 @@ def test_shopify():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("神戶風月堂爬蟲工具 (修正版 v2.0)")
-    print(f"最低成本價門檻：¥{MIN_COST_THRESHOLD}")
-    print("新增功能：標題重複檢查")
+    print("神戶風月堂爬蟲工具 v2.0")
+    print("新增功能：重複商品診斷、標題重複檢查")
     print("=" * 50)
     
     port = int(os.environ.get('PORT', 8080))
-    print(f"開啟瀏覽器訪問: http://localhost:{port}")
-    
     app.run(host='0.0.0.0', port=port, debug=False)

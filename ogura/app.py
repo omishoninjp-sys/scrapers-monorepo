@@ -6,6 +6,7 @@
 3. 計算材積重量 vs 實際重量，取大值
 4. 上架到 Shopify（不重複上架）
 5. 原價寫入成本價（Cost）
+6. ★ 自動同步庫存：已上架商品缺貨 → 設為草稿；恢復庫存 → 重新上架
 """
 
 from flask import Flask, render_template, jsonify, request
@@ -66,10 +67,8 @@ def load_shopify_token():
         with open(token_file, 'r') as f:
             data = json.load(f)
             SHOPIFY_ACCESS_TOKEN = data.get('access_token', '')
-            # 從 shop 欄位取得商店名稱，支援多種格式
             shop = data.get('shop', '')
             if shop:
-                # 移除 .myshopify.com 和 https:// 等
                 SHOPIFY_SHOP = shop.replace('https://', '').replace('http://', '').replace('.myshopify.com', '').strip('/')
             
             print(f"[設定] 從檔案載入 - 商店: {SHOPIFY_SHOP}")
@@ -87,10 +86,7 @@ def calculate_selling_price(cost, weight):
     
     shipping_cost = weight * 1250 if weight else 0
     price = (cost + shipping_cost) / 0.7
-    
-    # 四捨五入到整數
     price = round(price)
-    
     return price
 
 def translate_with_chatgpt(title, description):
@@ -140,7 +136,6 @@ def translate_with_chatgpt(title, description):
             result = response.json()
             content = result['choices'][0]['message']['content']
             
-            # 清理可能的 markdown 標記
             content = content.strip()
             if content.startswith('```'):
                 content = content.split('\n', 1)[1]
@@ -148,7 +143,6 @@ def translate_with_chatgpt(title, description):
                 content = content.rsplit('```', 1)[0]
             content = content.strip()
             
-            # 解析 JSON
             translated = json.loads(content)
             return {
                 'success': True,
@@ -177,16 +171,6 @@ def translate_with_chatgpt(title, description):
             'meta_description': ''
         }
 
-# 模擬瀏覽器 Headers
-BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8,zh-TW;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Referer': 'https://www.ogurasansou.co.jp/',
-}
-
 # 全域變數存儲爬取狀態
 scrape_status = {
     "running": False,
@@ -197,7 +181,8 @@ scrape_status = {
     "errors": [],
     "uploaded": 0,
     "skipped": 0,
-    "deleted": 0
+    "deleted": 0,
+    "reactivated": 0
 }
 
 def get_shopify_headers():
@@ -218,7 +203,7 @@ def get_existing_skus():
 
 def get_existing_products_map():
     """取得 Shopify 已存在的商品，回傳 {sku: product_id} 字典"""
-    products_map = {}  # {sku: product_id}
+    products_map = {}
     url = shopify_api_url("products.json?limit=250")
     
     while url:
@@ -235,7 +220,6 @@ def get_existing_products_map():
                 if sku and product_id:
                     products_map[sku] = product_id
         
-        # 處理分頁
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
             match = re.search(r'<([^>]+)>; rel="next"', link_header)
@@ -248,9 +232,52 @@ def get_existing_products_map():
     
     return products_map
 
-def get_collection_products_map(collection_id):
-    """只取得特定 Collection 內的商品，回傳 {sku: product_id} 字典"""
-    products_map = {}  # {sku: product_id}
+def get_existing_products_full():
+    """
+    取得 Shopify 所有商品的完整資訊
+    回傳 {sku: {'product_id': id, 'status': 'active'|'draft'}} 字典
+    包含 active 和 draft 狀態的商品
+    """
+    products_map = {}
+    # 注意：加上 status=any 才能取得 draft 商品
+    url = shopify_api_url("products.json?limit=250&status=any")
+    
+    while url:
+        response = requests.get(url, headers=get_shopify_headers())
+        if response.status_code != 200:
+            print(f"Error fetching products: {response.status_code}")
+            break
+        
+        data = response.json()
+        for product in data.get('products', []):
+            product_id = product.get('id')
+            status = product.get('status', 'active')
+            for variant in product.get('variants', []):
+                sku = variant.get('sku')
+                if sku and product_id:
+                    products_map[sku] = {
+                        'product_id': product_id,
+                        'status': status
+                    }
+        
+        link_header = response.headers.get('Link', '')
+        if 'rel="next"' in link_header:
+            match = re.search(r'<([^>]+)>; rel="next"', link_header)
+            if match:
+                url = match.group(1)
+            else:
+                url = None
+        else:
+            url = None
+    
+    return products_map
+
+def get_collection_products_full(collection_id):
+    """
+    取得特定 Collection 內所有商品完整資訊
+    回傳 {sku: {'product_id': id, 'status': 'active'|'draft'}} 字典
+    """
+    products_map = {}
     
     if not collection_id:
         print("[WARNING] 沒有 Collection ID，跳過")
@@ -267,12 +294,15 @@ def get_collection_products_map(collection_id):
         data = response.json()
         for product in data.get('products', []):
             product_id = product.get('id')
+            status = product.get('status', 'active')
             for variant in product.get('variants', []):
                 sku = variant.get('sku')
                 if sku and product_id:
-                    products_map[sku] = product_id
+                    products_map[sku] = {
+                        'product_id': product_id,
+                        'status': status
+                    }
         
-        # 處理分頁
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
             match = re.search(r'<([^>]+)>; rel="next"', link_header)
@@ -286,11 +316,15 @@ def get_collection_products_map(collection_id):
     print(f"[INFO] Collection 內有 {len(products_map)} 個商品")
     return products_map
 
-def delete_shopify_product(product_id):
-    """將 Shopify 商品設為草稿（而非刪除）"""
+def get_collection_products_map(collection_id):
+    """向下相容：只回傳 {sku: product_id}"""
+    full = get_collection_products_full(collection_id)
+    return {sku: info['product_id'] for sku, info in full.items()}
+
+def set_product_draft(product_id):
+    """將 Shopify 商品設為草稿"""
     url = shopify_api_url(f"products/{product_id}.json")
     
-    # 改成更新狀態為 draft，而非刪除
     response = requests.put(url, headers=get_shopify_headers(), json={
         "product": {
             "id": product_id,
@@ -305,40 +339,55 @@ def delete_shopify_product(product_id):
         print(f"[設為草稿失敗] Product ID: {product_id}, 錯誤: {response.status_code}")
         return False
 
+def set_product_active(product_id):
+    """將草稿商品重新上架"""
+    url = shopify_api_url(f"products/{product_id}.json")
+    
+    response = requests.put(url, headers=get_shopify_headers(), json={
+        "product": {
+            "id": product_id,
+            "status": "active"
+        }
+    })
+    
+    if response.status_code == 200:
+        print(f"[重新上架] Product ID: {product_id}")
+        # 重新發布到所有渠道
+        publish_to_all_channels(product_id)
+        return True
+    else:
+        print(f"[重新上架失敗] Product ID: {product_id}, 錯誤: {response.status_code}")
+        return False
+
+# 保留舊名稱的向下相容
+def delete_shopify_product(product_id):
+    """將 Shopify 商品設為草稿（向下相容）"""
+    return set_product_draft(product_id)
+
 def parse_dimension_weight(html_content):
     """
     解析寸法和重量
-    【寸法】タテ292×ヨコ259×高さ138mm
-    【重量】1.46kg
-    
     材積重量計算：長*寬*高/6000000
     取材積重量和實際重量的較大值
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # 找規格資訊
     dimension = None
     weight = None
     
-    # 找包含寸法和重量的文字
     text = soup.get_text()
     
-    # 解析寸法
     dim_match = re.search(r'【寸法】[タテ縦]*(\d+(?:\.\d+)?)[×xX][ヨコ横]*(\d+(?:\.\d+)?)[×xX][高さ]*(\d+(?:\.\d+)?)\s*mm', text)
     if dim_match:
         h, w, d = float(dim_match.group(1)), float(dim_match.group(2)), float(dim_match.group(3))
-        # 材積重量 = 長*寬*高/6000000 (cm轉換已在公式中)
-        # 因為是 mm，所以要除以 6,000,000,000 或先轉 cm
         dimension_weight = (h * w * d) / 6000000
         dimension_weight = round(dimension_weight, 2)
         dimension = {"h": h, "w": w, "d": d, "volume_weight": dimension_weight}
     
-    # 解析重量
     weight_match = re.search(r'【重量】(\d+(?:\.\d+)?)\s*kg', text)
     if weight_match:
         weight = float(weight_match.group(1))
     
-    # 計算最終重量（取較大值）
     final_weight = 0
     if dimension and weight:
         final_weight = max(dimension['volume_weight'], weight)
@@ -353,11 +402,86 @@ def parse_dimension_weight(html_content):
         "final_weight": round(final_weight, 2)
     }
 
+def check_product_in_stock(soup, page_text):
+    """
+    ★ 增強版庫存偵測
+    綜合多種方式判斷商品是否有庫存
+    回傳 True = 有庫存, False = 無庫存
+    """
+    
+    # ===== 1. 明確的無庫存文字 =====
+    out_of_stock_keywords = [
+        '在庫がありません',
+        '在庫：×',
+        '在庫切れ',
+        '売り切れ',
+        '品切れ',
+        '完売',
+        '販売終了',
+        'SOLD OUT',
+        'sold out',
+        'ただ今お取扱いできない商品です',
+        'お取扱いできない商品',
+    ]
+    
+    for keyword in out_of_stock_keywords:
+        if keyword in page_text:
+            print(f"[庫存偵測] 發現無庫存關鍵字: '{keyword}'")
+            return False
+    
+    # ===== 2. 檢查在庫狀態標記 =====
+    # 有庫存：在庫：○  或  在庫：△（殘りわずか）
+    # 無庫存：在庫：×
+    stock_match = re.search(r'在庫[：:]\s*([○△×])', page_text)
+    if stock_match:
+        stock_symbol = stock_match.group(1)
+        if stock_symbol == '×':
+            print(f"[庫存偵測] 在庫標記為 ×")
+            return False
+        elif stock_symbol in ('○', '△'):
+            print(f"[庫存偵測] 在庫標記為 {stock_symbol}")
+            return True
+    
+    # ===== 3. 檢查購物車按鈕是否存在 =====
+    cart_button = soup.select_one(
+        'a[href*="cart.aspx?goods="], '
+        'input[value*="買い物かご"], '
+        'button:contains("買い物かご"), '
+        '.block-cart-btn'
+    )
+    # 也檢查文字中是否有「買い物かごに入れる」
+    has_cart_text = '買い物かごに入れる' in page_text
+    
+    if not cart_button and not has_cart_text:
+        print(f"[庫存偵測] 找不到購物車按鈕")
+        return False
+    
+    # ===== 4. 檢查是否為已下架商品頁面 =====
+    # 官網下架商品會顯示特定訊息
+    if 'ご指定の商品は販売終了か' in page_text:
+        print(f"[庫存偵測] 商品已下架（販売終了）")
+        return False
+    
+    # ===== 5. 檢查 CSS class =====
+    # 有些網站用 class 來標記無庫存
+    sold_out_elem = soup.select_one(
+        '.sold-out, .out-of-stock, .stock-none, '
+        '.is-soldout, .is-out-of-stock, '
+        '[data-stock="0"], [data-soldout="true"]'
+    )
+    if sold_out_elem:
+        print(f"[庫存偵測] 發現無庫存 CSS class")
+        return False
+    
+    # ===== 6. 預設：如果以上都沒命中，視為有庫存 =====
+    print(f"[庫存偵測] 未發現無庫存跡象，判定為有庫存")
+    return True
+
 def scrape_product_list(category_url):
     """爬取商品列表頁面，取得所有商品連結（包含所有分頁）"""
     products = []
     page = 1
-    max_pages = 10  # 網站目前只有 7 頁
+    max_pages = 10
     
     # 先訪問首頁取得 cookies
     session.get(BASE_URL, timeout=30)
@@ -365,9 +489,8 @@ def scrape_product_list(category_url):
     
     while page <= max_pages:
         if page == 1:
-            url = CATEGORY_URL  # 第一頁用原始 URL
+            url = CATEGORY_URL
         else:
-            # 分頁格式: /shop/c/c10/ -> /shop/c/c10_p2/
             url = f"https://www.ogurasansou.co.jp/shop/c/c10_p{page}/"
         
         print(f"[爬取] 第 {page} 頁: {url}")
@@ -376,24 +499,20 @@ def scrape_product_list(category_url):
             response = session.get(url, timeout=30)
             response.encoding = 'utf-8'
             
-            # 如果頁面不存在（404）
             if response.status_code != 200:
                 print(f"[結束] 第 {page} 頁不存在，狀態碼: {response.status_code}")
                 break
             
-            # 檢查是否被重定向回第一頁（表示該頁不存在）
             if page > 1 and '_p' not in response.url:
                 print(f"[結束] 第 {page} 頁被重定向回第一頁")
                 break
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # 直接找所有商品連結（格式：/shop/g/g00167/）
             all_links = soup.find_all('a', href=re.compile(r'/shop/g/g\d+/'))
             
             print(f"[DEBUG] 第 {page} 頁找到 {len(all_links)} 個商品連結")
             
-            # 計算這一頁找到幾個新商品
             new_count = 0
             seen_skus_this_page = set()
             
@@ -402,12 +521,10 @@ def scrape_product_list(category_url):
                 sku_match = re.search(r'/g/g(\d+)/', href)
                 if sku_match:
                     sku = sku_match.group(1)
-                    # 避免同一頁重複計算
                     if sku in seen_skus_this_page:
                         continue
                     seen_skus_this_page.add(sku)
                     
-                    # 避免跨頁重複
                     if sku not in [p['sku'] for p in products]:
                         full_url = urljoin(BASE_URL, href)
                         products.append({
@@ -418,14 +535,12 @@ def scrape_product_list(category_url):
             
             print(f"[進度] 第 {page} 頁新增 {new_count} 個商品，累計 {len(products)} 個")
             
-            # 如果這頁沒有新商品，可能已經到底了
             if new_count == 0:
                 print(f"[結束] 第 {page} 頁沒有新商品")
                 break
             
-            # 繼續下一頁
             page += 1
-            time.sleep(0.5)  # 避免請求過快
+            time.sleep(0.5)
             
         except Exception as e:
             print(f"[錯誤] 爬取第 {page} 頁失敗: {e}")
@@ -447,23 +562,22 @@ def scrape_product_detail(url):
             return None
         
         soup = BeautifulSoup(response.text, 'html.parser')
+        page_text = soup.get_text()
         
-        # 商品名稱 - 從 h2.block-goods-name--text 取得
+        # 商品名稱
         title = ""
         title_elem = soup.select_one('h2.block-goods-name--text, .block-goods-name--text')
         if title_elem:
-            # 取得完整文字，包含 span 內容
             title = title_elem.get_text(strip=True)
         
         if not title:
-            # 備用方案：從 title tag 取得
             title_tag = soup.select_one('title')
             if title_tag:
                 title = title_tag.get_text(strip=True).split(':')[0].split('|')[0].strip()
         
         print(f"[DEBUG] 標題: {title}")
         
-        # 商品說明 - 從 .block-goods-comment1 取得
+        # 商品說明
         description = ""
         desc_elem = soup.select_one('.block-goods-comment1')
         if desc_elem:
@@ -480,18 +594,16 @@ def scrape_product_detail(url):
                 price = int(price_match.group(1).replace(',', ''))
         
         if not price:
-            # 備用方案
-            price_match = re.search(r'[¥￥]([\d,]+)', soup.get_text())
+            price_match = re.search(r'[¥￥]([\d,]+)', page_text)
             if price_match:
                 price = int(price_match.group(1).replace(',', ''))
         
-        # 商品編號 - 強制從 URL 取得，確保一致性
+        # 商品編號 - 從 URL 取得
         sku = ""
         url_sku = re.search(r'/g/g(\d+)/', url)
         if url_sku:
             sku = url_sku.group(1)
         
-        # 備用方案：從頁面元素取得
         if not sku:
             sku_elem = soup.select_one('.block-thumbnail-t--goods-id')
             if sku_elem:
@@ -501,20 +613,17 @@ def scrape_product_detail(url):
         
         print(f"[DEBUG] SKU: {sku}")
         
-        # 庫存狀態
-        in_stock = True
-        page_text = soup.get_text()
-        if '在庫がありません' in page_text or '在庫：×' in page_text or '在庫切れ' in page_text:
-            in_stock = False
+        # ★ 使用增強版庫存偵測
+        in_stock = check_product_in_stock(soup, page_text)
+        print(f"[DEBUG] 庫存狀態: {'有庫存' if in_stock else '無庫存'}")
         
         # 解析重量
         weight_info = parse_dimension_weight(response.text)
         
-        # 圖片 - 從 slick-slide 的 a 標籤 href 取得
+        # 圖片
         images = []
         seen_images = set()
         
-        # 從 slick-slide 取得圖片（排除 slick-cloned 避免重複）
         for slide in soup.select('.slick-slide:not(.slick-cloned) a.js-lightbox-gallery-info-ogura'):
             href = slide.get('href', '')
             if href and '/img/goods/' in href:
@@ -523,7 +632,6 @@ def scrape_product_detail(url):
                     seen_images.add(full_src)
                     images.append(full_src)
         
-        # 備用方案：從所有 a 標籤找圖片連結
         if not images:
             for link in soup.select('a[href*="/img/goods/"]'):
                 href = link.get('href', '')
@@ -533,7 +641,6 @@ def scrape_product_detail(url):
                         seen_images.add(full_src)
                         images.append(full_src)
         
-        # 再備用：從 img 標籤找
         if not images:
             for img in soup.select('img.block-src-l--image, img[src*="/img/goods/"]'):
                 src = img.get('src', '')
@@ -548,17 +655,14 @@ def scrape_product_detail(url):
         # 規格資訊
         specs = {}
         
-        # 內容量
         content_match = re.search(r'【内容量】([^\n【]+)', page_text)
         if content_match:
             specs['content'] = content_match.group(1).strip()
         
-        # 賞味期限
         expiry_match = re.search(r'賞味期限[：:]\s*([^\n]+)', page_text)
         if expiry_match:
             specs['expiry'] = expiry_match.group(1).strip()
         
-        # 過敏原
         allergen_match = re.search(r'アレルギー[：:]\s*([^\n]+)', page_text)
         if allergen_match:
             specs['allergen'] = allergen_match.group(1).strip()
@@ -572,7 +676,7 @@ def scrape_product_detail(url):
             'description': description,
             'weight': weight_info['final_weight'],
             'weight_info': weight_info,
-            'images': images[:10],  # 最多10張
+            'images': images[:10],
             'specs': specs
         }
         
@@ -584,7 +688,6 @@ def scrape_product_detail(url):
 
 def get_or_create_collection(collection_title="小倉山莊"):
     """取得或建立 Collection"""
-    # 先搜尋是否已存在
     response = requests.get(
         shopify_api_url(f'custom_collections.json?title={collection_title}'),
         headers=get_shopify_headers()
@@ -596,7 +699,6 @@ def get_or_create_collection(collection_title="小倉山莊"):
             if col['title'] == collection_title:
                 return col['id']
     
-    # 不存在則建立
     response = requests.post(
         shopify_api_url('custom_collections.json'),
         headers=get_shopify_headers(),
@@ -637,7 +739,6 @@ def publish_to_all_channels(product_id):
         'Content-Type': 'application/json',
     }
     
-    # 先用 GraphQL 查詢所有可發布的渠道
     query = """
     {
       publications(first: 20) {
@@ -661,7 +762,6 @@ def publish_to_all_channels(product_id):
     result = response.json()
     publications = result.get('data', {}).get('publications', {}).get('edges', [])
     
-    # 過濾出唯一的渠道（去重）
     seen_names = set()
     unique_publications = []
     for pub in publications:
@@ -672,7 +772,6 @@ def publish_to_all_channels(product_id):
     
     print(f"[發布] 找到 {len(unique_publications)} 個唯一銷售渠道: {[p['name'] for p in unique_publications]}")
     
-    # 建立發布請求
     publication_inputs = [{"publicationId": pub['id']} for pub in unique_publications]
     
     mutation = """
@@ -710,7 +809,6 @@ def publish_to_all_channels(product_id):
     if pub_response.status_code == 200:
         pub_result = pub_response.json()
         
-        # 安全取值
         data = pub_result.get('data') or {}
         publishable_publish = data.get('publishablePublish') or {}
         errors = publishable_publish.get('userErrors') or []
@@ -719,7 +817,6 @@ def publish_to_all_channels(product_id):
         available_count = available_count_obj.get('count', 0)
         
         if errors:
-            # 過濾掉不存在的渠道錯誤，只顯示其他錯誤
             real_errors = [e for e in errors if 'does not exist' not in e.get('message', '')]
             if real_errors:
                 print(f"[發布] 錯誤: {real_errors}")
@@ -734,7 +831,6 @@ def publish_to_all_channels(product_id):
 def upload_to_shopify(product, collection_id=None):
     """上傳商品到 Shopify"""
     
-    # 翻譯商品名稱和說明
     print(f"[翻譯] 正在翻譯: {product['title'][:30]}...")
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
     
@@ -743,15 +839,13 @@ def upload_to_shopify(product, collection_id=None):
     else:
         print(f"[翻譯失敗] 使用原文")
     
-    # 計算售價
-    cost = product['price']  # 進貨價 = 原網站售價
+    cost = product['price']
     weight = product.get('weight', 0)
     selling_price = calculate_selling_price(cost, weight)
     
     print(f"[價格計算] 進貨價: ¥{cost}, 重量: {weight}kg, 售價: ¥{selling_price}")
     print(f"[價格公式] ({cost} + {weight} * 1250) / 0.7 = {selling_price}")
     
-    # 準備圖片資料
     images = []
     for idx, img_url in enumerate(product.get('images', [])):
         images.append({
@@ -759,28 +853,27 @@ def upload_to_shopify(product, collection_id=None):
             'position': idx + 1
         })
     
-    # 建立商品資料
     shopify_product = {
         'product': {
-            'title': translated['title'],  # 翻譯後的標題
-            'body_html': translated['description'],  # 翻譯後的說明
+            'title': translated['title'],
+            'body_html': translated['description'],
             'vendor': '小倉山荘',
             'product_type': '米菓・詰め合わせ',
-            'status': 'active',  # 直接上架
-            'published': True,   # 發布
+            'status': 'active',
+            'published': True,
             'variants': [{
                 'sku': product['sku'],
-                'price': f"{selling_price:.2f}",  # 計算後的售價，格式化為小數
+                'price': f"{selling_price:.2f}",
                 'weight': product.get('weight', 0),
                 'weight_unit': 'kg',
-                'inventory_management': None,  # 關閉庫存追蹤
-                'inventory_policy': 'continue',  # 允許超賣
+                'inventory_management': None,
+                'inventory_policy': 'continue',
                 'requires_shipping': True
             }],
             'images': images,
             'tags': '小倉山荘, 日本, 京都, 米菓, あられ, せんべい, 伴手禮, 日本零食',
-            'metafields_global_title_tag': translated['page_title'],  # SEO Page Title
-            'metafields_global_description_tag': translated['meta_description'],  # SEO Meta Description
+            'metafields_global_title_tag': translated['page_title'],
+            'metafields_global_description_tag': translated['meta_description'],
             'metafields': [
                 {
                     'namespace': 'custom',
@@ -794,7 +887,6 @@ def upload_to_shopify(product, collection_id=None):
     
     print(f"[DEBUG] 準備上傳: price={selling_price:.2f}")
     
-    # 發送請求
     response = requests.post(
         shopify_api_url('products.json'),
         headers=get_shopify_headers(),
@@ -810,7 +902,6 @@ def upload_to_shopify(product, collection_id=None):
         
         print(f"[DEBUG] 商品建立成功: ID={product_id}, Variant ID={variant_id}")
         
-        # 更新 variant 的 cost (成本價)
         update_cost_response = requests.put(
             shopify_api_url(f'variants/{variant_id}.json'),
             headers=get_shopify_headers(),
@@ -823,11 +914,9 @@ def upload_to_shopify(product, collection_id=None):
         )
         print(f"[DEBUG] 更新 Cost 回應: {update_cost_response.status_code}")
         
-        # 加入 Collection
         if collection_id:
             add_product_to_collection(product_id, collection_id)
         
-        # 發布到所有渠道
         publish_to_all_channels(product_id)
         
         return {'success': True, 'product': created_product, 'translated': translated, 'selling_price': selling_price, 'cost': cost}
@@ -912,9 +1001,11 @@ def index():
         .log-success {{ color: #4ec9b0; }}
         .log-error {{ color: #f14c4c; }}
         .log-skip {{ color: #ce9178; }}
-        .stats {{ display: flex; gap: 20px; margin-top: 15px; }}
+        .log-reactivate {{ color: #dcdcaa; }}
+        .stats {{ display: flex; gap: 15px; margin-top: 15px; flex-wrap: wrap; }}
         .stat {{ 
             flex: 1; 
+            min-width: 100px;
             text-align: center; 
             padding: 15px;
             background: #f8f9fa;
@@ -943,9 +1034,15 @@ def index():
     </div>
     
     <div class="card">
-        <h3>開始爬取</h3>
-        <p>爬取 ogurasansou.co.jp 全站商品並上架到 Shopify</p>
-        <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
+        <h3>開始爬取 &amp; 同步</h3>
+        <p>爬取官網全站商品，自動同步庫存狀態到 Shopify</p>
+        <ul style="font-size: 14px; color: #666;">
+            <li>新商品 → 自動上架</li>
+            <li>已上架但官網缺貨 → 自動設為草稿</li>
+            <li>草稿商品但官網恢復庫存 → 自動重新上架</li>
+            <li>官網已下架的商品 → 設為草稿</li>
+        </ul>
+        <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取 &amp; 同步</button>
         
         <div id="progressSection" style="display: none;">
             <div class="progress-bar">
@@ -956,7 +1053,11 @@ def index():
             <div class="stats">
                 <div class="stat">
                     <div class="stat-number" id="uploadedCount">0</div>
-                    <div class="stat-label">已上架</div>
+                    <div class="stat-label">新上架</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number" id="reactivatedCount" style="color: #27ae60;">0</div>
+                    <div class="stat-label">恢復上架</div>
                 </div>
                 <div class="stat">
                     <div class="stat-number" id="skippedCount">0</div>
@@ -1029,7 +1130,7 @@ def index():
         
         async function startScrape() {{
             clearLog();
-            log('開始爬取流程...');
+            log('開始爬取 & 同步流程...');
             
             document.getElementById('startBtn').disabled = true;
             document.getElementById('progressSection').style.display = 'block';
@@ -1044,7 +1145,7 @@ def index():
                     return;
                 }}
                 
-                log('✓ 爬取任務已啟動', 'success');
+                log('✓ 同步任務已啟動', 'success');
                 pollInterval = setInterval(pollStatus, 1000);
                 
             }} catch (e) {{
@@ -1064,6 +1165,7 @@ def index():
                     data.current_product + ' (' + data.progress + '/' + data.total + ')';
                 
                 document.getElementById('uploadedCount').textContent = data.uploaded;
+                document.getElementById('reactivatedCount').textContent = data.reactivated || 0;
                 document.getElementById('skippedCount').textContent = data.skipped;
                 document.getElementById('deletedCount').textContent = data.deleted || 0;
                 document.getElementById('errorCount').textContent = data.errors.length;
@@ -1071,8 +1173,12 @@ def index():
                 if (!data.running && data.progress > 0) {{
                     clearInterval(pollInterval);
                     document.getElementById('startBtn').disabled = false;
-                    log('========== 爬取完成 ==========', 'success');
-                    log('上架: ' + data.uploaded + ' | 跳過: ' + data.skipped + ' | 草稿: ' + (data.deleted || 0) + ' | 錯誤: ' + data.errors.length);
+                    log('========== 同步完成 ==========', 'success');
+                    log('新上架: ' + data.uploaded + 
+                        ' | 恢復: ' + (data.reactivated || 0) + 
+                        ' | 跳過: ' + data.skipped + 
+                        ' | 草稿: ' + (data.deleted || 0) + 
+                        ' | 錯誤: ' + data.errors.length);
                 }}
                 
             }} catch (e) {{
@@ -1107,15 +1213,14 @@ def start_scrape():
         "errors": [],
         "uploaded": 0,
         "skipped": 0,
-        "deleted": 0
+        "deleted": 0,
+        "reactivated": 0
     }
     
-    # 載入 token
     if not load_shopify_token():
         scrape_status['running'] = False
         return jsonify({'error': '請先完成 Shopify OAuth 授權'}), 400
     
-    # 背景執行爬取
     import threading
     thread = threading.Thread(target=run_scrape)
     thread.start()
@@ -1123,71 +1228,145 @@ def start_scrape():
     return jsonify({'message': '開始爬取'})
 
 def run_scrape():
-    """執行爬取流程"""
+    """
+    ★ 改進後的爬取流程
+    
+    核心邏輯：
+    1. 取得 Shopify 上「小倉山莊」Collection 內所有商品（含 draft）
+    2. 爬取官網所有商品列表
+    3. 對每個官網商品：
+       a. Shopify 不存在 → 有庫存就新上架
+       b. Shopify 存在且 active → 重新檢查庫存，缺貨就設草稿
+       c. Shopify 存在且 draft → 重新檢查庫存，恢復就重新上架
+    4. Collection 內有、但官網已不存在的 → 設為草稿
+    """
     global scrape_status
     
     try:
-        # 1. 取得 Shopify 所有商品 (用於檢查是否已存在，避免重複上架)
-        scrape_status['current_product'] = "正在檢查 Shopify 已有商品..."
-        existing_products_map = get_existing_products_map()
-        existing_skus = set(existing_products_map.keys())
-        print(f"[INFO] Shopify 全站已有 {len(existing_skus)} 個商品")
-        
-        # 2. 取得或建立 Collection
+        # 1. 取得或建立 Collection
         scrape_status['current_product'] = "正在設定 Collection..."
         collection_id = get_or_create_collection("小倉山莊")
         print(f"[INFO] Collection ID: {collection_id}")
         
-        # 2.5 取得「小倉山莊」Collection 內的商品（只有這些才會被設為草稿）
-        scrape_status['current_product'] = "正在取得 Collection 內商品..."
-        collection_products_map = get_collection_products_map(collection_id)
-        collection_skus = set(collection_products_map.keys())
-        print(f"[INFO] 小倉山莊 Collection 內有 {len(collection_skus)} 個商品")
+        # 2. 取得 Shopify 所有商品（含 draft），用於新商品查重
+        scrape_status['current_product'] = "正在取得 Shopify 商品列表..."
+        all_products_full = get_existing_products_full()
+        print(f"[INFO] Shopify 全站共 {len(all_products_full)} 個商品 (含草稿)")
         
-        # 3. 爬取商品列表
-        scrape_status['current_product'] = "正在爬取商品列表..."
+        # 3. 取得「小倉山莊」Collection 內的商品（含 draft）
+        scrape_status['current_product'] = "正在取得 Collection 內商品..."
+        collection_products_full = get_collection_products_full(collection_id)
+        print(f"[INFO] 小倉山莊 Collection 內有 {len(collection_products_full)} 個商品")
+        
+        # 統計 Collection 內的狀態
+        active_count = sum(1 for v in collection_products_full.values() if v['status'] == 'active')
+        draft_count = sum(1 for v in collection_products_full.values() if v['status'] == 'draft')
+        print(f"[INFO] Collection 狀態: active={active_count}, draft={draft_count}")
+        
+        # 4. 爬取官網商品列表
+        scrape_status['current_product'] = "正在爬取官網商品列表..."
         product_list = scrape_product_list(CATEGORY_URL)
         scrape_status['total'] = len(product_list)
-        print(f"[INFO] 找到 {len(product_list)} 個商品")
+        print(f"[INFO] 官網找到 {len(product_list)} 個商品")
         
-        # 取得官網所有 SKU
         website_skus = set(item['sku'] for item in product_list)
         print(f"[INFO] 官網 SKU 列表: {len(website_skus)} 個")
         
-        # 4. 爬取每個商品詳情並上傳
+        # 5. 逐一處理每個官網商品
         for idx, item in enumerate(product_list):
             scrape_status['progress'] = idx + 1
-            scrape_status['current_product'] = f"處理: {item['sku']}"
+            sku = item['sku']
+            scrape_status['current_product'] = f"處理: {sku} ({idx+1}/{len(product_list)})"
             
-            # 檢查是否已存在
-            if item['sku'] in existing_skus:
-                print(f"[跳過] SKU {item['sku']} 已存在")
-                scrape_status['skipped'] += 1
+            # 檢查這個 SKU 在 Shopify 上的狀態
+            existing_info = all_products_full.get(sku)
+            
+            if existing_info:
+                product_id = existing_info['product_id']
+                current_status = existing_info['status']
+                
+                # ★ 已存在的商品：重新檢查庫存
+                print(f"[檢查庫存] SKU {sku} 已存在 (狀態: {current_status})，重新檢查庫存...")
+                
+                product = scrape_product_detail(item['url'])
+                if not product:
+                    print(f"[跳過] SKU {sku} 無法爬取詳情")
+                    scrape_status['skipped'] += 1
+                    time.sleep(0.5)
+                    continue
+                
+                if product['in_stock'] and product['price'] >= 1000:
+                    # 官網有庫存
+                    if current_status == 'draft':
+                        # ★ 草稿 → 恢復上架
+                        print(f"[恢復上架] SKU {sku} 官網恢復庫存，重新上架")
+                        if set_product_active(product_id):
+                            scrape_status['reactivated'] += 1
+                            scrape_status['products'].append({
+                                'sku': sku,
+                                'title': product['title'],
+                                'status': 'reactivated'
+                            })
+                        else:
+                            scrape_status['errors'].append(f"恢復上架失敗: {sku}")
+                    else:
+                        # active → 保持不動
+                        print(f"[跳過] SKU {sku} 有庫存且已上架")
+                        scrape_status['skipped'] += 1
+                else:
+                    # 官網無庫存或價格過低
+                    if current_status == 'active':
+                        # ★ 上架中 → 設為草稿
+                        reason = '無庫存' if not product['in_stock'] else f'價格過低 (¥{product["price"]})'
+                        print(f"[設為草稿] SKU {sku} {reason}")
+                        if set_product_draft(product_id):
+                            scrape_status['deleted'] += 1
+                            scrape_status['products'].append({
+                                'sku': sku,
+                                'title': product['title'],
+                                'status': 'draft',
+                                'reason': reason
+                            })
+                        else:
+                            scrape_status['errors'].append(f"設為草稿失敗: {sku}")
+                    else:
+                        # 本來就是草稿 → 保持不動
+                        print(f"[跳過] SKU {sku} 無庫存且已是草稿")
+                        scrape_status['skipped'] += 1
+                
+                time.sleep(0.5)
                 continue
             
-            # 爬取詳情
+            # ===== 新商品：尚未在 Shopify 上 =====
             product = scrape_product_detail(item['url'])
             if not product:
                 scrape_status['errors'].append(f"無法爬取: {item['url']}")
+                time.sleep(0.5)
                 continue
             
             # 檢查庫存
             if not product['in_stock']:
-                print(f"[跳過] SKU {product['sku']} 無庫存")
+                print(f"[跳過] SKU {product['sku']} 無庫存（新商品不上架）")
                 scrape_status['skipped'] += 1
+                time.sleep(0.5)
                 continue
             
-            # 檢查價格（1000円以下不上架）
+            # 檢查價格
             if product['price'] < 1000:
                 print(f"[跳過] SKU {product['sku']} 價格過低 (¥{product['price']})")
                 scrape_status['skipped'] += 1
+                time.sleep(0.5)
                 continue
             
-            # 上傳到 Shopify（含 Collection）
+            # 上傳到 Shopify
             result = upload_to_shopify(product, collection_id)
             if result['success']:
-                print(f"[成功] 上傳 SKU {product['sku']}")
-                existing_skus.add(product['sku'])  # 防止同一批次重複上架
+                print(f"[成功] 新上架 SKU {product['sku']}")
+                # 更新本地快取，防止同批次重複
+                all_products_full[product['sku']] = {
+                    'product_id': result['product']['id'],
+                    'status': 'active'
+                }
                 scrape_status['uploaded'] += 1
                 scrape_status['products'].append({
                     'sku': product['sku'],
@@ -1195,7 +1374,6 @@ def run_scrape():
                     'original_title': product['title'],
                     'price': product['price'],
                     'weight': product['weight'],
-                    'page_title': result.get('translated', {}).get('page_title', ''),
                     'status': 'success'
                 })
             else:
@@ -1208,38 +1386,48 @@ def run_scrape():
                     'error': result['error']
                 })
             
-            # 避免 API 限制
             time.sleep(1)
         
-        # 5. 設為草稿：只針對「小倉山莊 Collection」內、但官網已下架的商品
-        scrape_status['current_product'] = "正在檢查已下架商品..."
-        skus_to_draft = collection_skus - website_skus  # 只比對 Collection 內的商品
+        # 6. ★ 處理官網已下架的商品（Collection 內有，但官網列表沒有）
+        scrape_status['current_product'] = "正在處理官網已下架的商品..."
+        collection_skus = set(collection_products_full.keys())
+        skus_to_check = collection_skus - website_skus
         
-        if skus_to_draft:
-            print(f"[INFO] 發現 {len(skus_to_draft)} 個商品需要設為草稿: {skus_to_draft}")
+        if skus_to_check:
+            print(f"[INFO] 發現 {len(skus_to_check)} 個商品在官網列表中不存在，需要確認")
             
-            for sku in skus_to_draft:
-                scrape_status['current_product'] = f"設為草稿: {sku}"
-                product_id = collection_products_map.get(sku)
+            for sku in skus_to_check:
+                info = collection_products_full.get(sku, {})
+                product_id = info.get('product_id')
+                current_status = info.get('status', 'active')
+                
+                # 如果已經是草稿就跳過
+                if current_status == 'draft':
+                    print(f"[跳過] SKU {sku} 已是草稿")
+                    continue
                 
                 if product_id:
-                    if delete_shopify_product(product_id):
+                    scrape_status['current_product'] = f"設為草稿 (官網已下架): {sku}"
+                    print(f"[設為草稿] SKU {sku} 官網已下架")
+                    if set_product_draft(product_id):
                         scrape_status['deleted'] += 1
                         scrape_status['products'].append({
                             'sku': sku,
                             'status': 'draft',
+                            'reason': '官網已下架',
                             'title': f'已設為草稿 (SKU: {sku})'
                         })
                     else:
                         scrape_status['errors'].append(f"設為草稿失敗: {sku}")
                     
-                    # 避免 API 限制
                     time.sleep(0.5)
         else:
-            print("[INFO] 沒有需要設為草稿的商品")
+            print("[INFO] 沒有官網已下架的商品需要處理")
         
     except Exception as e:
         print(f"[錯誤] {e}")
+        import traceback
+        traceback.print_exc()
         scrape_status['errors'].append(str(e))
     
     finally:
@@ -1265,13 +1453,11 @@ def test_shopify():
 @app.route('/api/test-scrape')
 def test_scrape():
     """測試爬取並上架一個商品"""
-    # 載入 token
     if not load_shopify_token():
         return jsonify({'error': '請先完成 Shopify OAuth 授權'}), 400
     
     print(f"[DEBUG] Token: {SHOPIFY_ACCESS_TOKEN[:20]}...")
     
-    # 先測試 Shopify 連線
     test_response = requests.get(
         shopify_api_url('shop.json'),
         headers=get_shopify_headers()
@@ -1283,11 +1469,9 @@ def test_scrape():
             'detail': test_response.text
         }), 400
     
-    # 先訪問首頁取得 cookies
     session.get(BASE_URL, timeout=30)
     time.sleep(0.5)
     
-    # 爬取商品
     test_url = "https://www.ogurasansou.co.jp/shop/g/g00167/"
     product = scrape_product_detail(test_url)
     
@@ -1296,15 +1480,12 @@ def test_scrape():
     
     print(f"[DEBUG] 爬取成功: {product['title']}")
     
-    # 檢查庫存
     if not product['in_stock']:
         return jsonify({'error': '商品無庫存', 'product': product}), 400
     
-    # 取得或建立 Collection
     collection_id = get_or_create_collection("小倉山莊")
     print(f"[DEBUG] Collection ID: {collection_id}")
     
-    # 上傳到 Shopify
     result = upload_to_shopify(product, collection_id)
     
     print(f"[DEBUG] 上傳結果: {result}")
@@ -1341,7 +1522,6 @@ def test_scrape():
 @app.route('/api/test-translate')
 def test_translate():
     """測試翻譯功能"""
-    # 先爬取一個商品
     session.get(BASE_URL, timeout=30)
     time.sleep(0.5)
     
@@ -1351,7 +1531,6 @@ def test_translate():
     if not product:
         return jsonify({'error': '爬取失敗'}), 400
     
-    # 翻譯
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
     
     return jsonify({
@@ -1363,14 +1542,12 @@ def test_translate():
     })
 
 if __name__ == '__main__':
-    # 建立 templates 目錄
     os.makedirs('templates', exist_ok=True)
     
     print("=" * 50)
-    print("小倉山莊爬蟲工具")
+    print("小倉山莊爬蟲工具（含庫存同步）")
     print("=" * 50)
     
-    # 從環境變數取得 PORT，預設 8080
     port = int(os.environ.get('PORT', 8080))
     print(f"開啟瀏覽器訪問: http://localhost:{port}")
     print("=" * 50)

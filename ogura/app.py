@@ -235,7 +235,7 @@ def get_existing_products_map():
 def get_existing_products_full():
     """
     取得 Shopify 所有商品的完整資訊
-    回傳 {sku: {'product_id': id, 'status': 'active'|'draft'}} 字典
+    回傳 {sku: {'product_id': id, 'status': 'active'|'draft', 'vendor': str}} 字典
     包含 active 和 draft 狀態的商品
     """
     products_map = {}
@@ -252,12 +252,16 @@ def get_existing_products_full():
         for product in data.get('products', []):
             product_id = product.get('id')
             status = product.get('status', 'active')
+            vendor = product.get('vendor', '')
+            tags = product.get('tags', '')
             for variant in product.get('variants', []):
                 sku = variant.get('sku')
                 if sku and product_id:
                     products_map[sku] = {
                         'product_id': product_id,
-                        'status': status
+                        'status': status,
+                        'vendor': vendor,
+                        'tags': tags
                     }
         
         link_header = response.headers.get('Link', '')
@@ -1253,15 +1257,18 @@ def run_scrape():
         all_products_full = get_existing_products_full()
         print(f"[INFO] Shopify 全站共 {len(all_products_full)} 個商品 (含草稿)")
         
-        # 3. 取得「小倉山莊」Collection 內的商品（含 draft）
-        scrape_status['current_product'] = "正在取得 Collection 內商品..."
+        # 3. 取得「小倉山莊」Collection（僅用於新商品歸類）
+        scrape_status['current_product'] = "正在取得 Collection..."
         collection_products_full = get_collection_products_full(collection_id)
-        print(f"[INFO] 小倉山莊 Collection 內有 {len(collection_products_full)} 個商品")
         
-        # 統計 Collection 內的狀態
-        active_count = sum(1 for v in collection_products_full.values() if v['status'] == 'active')
-        draft_count = sum(1 for v in collection_products_full.values() if v['status'] == 'draft')
-        print(f"[INFO] Collection 狀態: active={active_count}, draft={draft_count}")
+        # 從全站商品統計小倉山莊的狀態（用 vendor 篩選，更可靠）
+        ogura_active = sum(1 for v in all_products_full.values() 
+                          if ('小倉山' in v.get('vendor', '') or '小倉山' in v.get('tags', '')) 
+                          and v['status'] == 'active')
+        ogura_draft = sum(1 for v in all_products_full.values() 
+                         if ('小倉山' in v.get('vendor', '') or '小倉山' in v.get('tags', '')) 
+                         and v['status'] == 'draft')
+        print(f"[INFO] 小倉山莊商品: active={ogura_active}, draft={ogura_draft}")
         
         # 4. 爬取官網商品列表
         scrape_status['current_product'] = "正在爬取官網商品列表..."
@@ -1388,16 +1395,30 @@ def run_scrape():
             
             time.sleep(1)
         
-        # 6. ★ 處理官網已下架的商品（Collection 內有，但官網列表沒有）
+        # 6. ★ 處理官網已下架的商品
+        #    不依賴 Collection API（它不回傳 draft 商品），
+        #    改用 all_products_full 中 vendor='小倉山荘' 的商品來比對
         scrape_status['current_product'] = "正在處理官網已下架的商品..."
-        collection_skus = set(collection_products_full.keys())
-        skus_to_check = collection_skus - website_skus
+        
+        # 從全站商品中篩選出小倉山莊的商品（用 vendor 或 tags 判斷）
+        ogura_skus_in_shopify = {}
+        for sku, info in all_products_full.items():
+            vendor = info.get('vendor', '')
+            tags = info.get('tags', '')
+            # 比對 vendor 或 tags 包含小倉山莊相關字串
+            if '小倉山' in vendor or '小倉山' in tags:
+                ogura_skus_in_shopify[sku] = info
+        
+        print(f"[INFO] Shopify 中小倉山莊商品共 {len(ogura_skus_in_shopify)} 個 (含草稿)")
+        
+        # 找出「Shopify 上有，但官網列表中沒有」的 SKU
+        skus_to_check = set(ogura_skus_in_shopify.keys()) - website_skus
         
         if skus_to_check:
-            print(f"[INFO] 發現 {len(skus_to_check)} 個商品在官網列表中不存在，需要確認")
+            print(f"[INFO] 發現 {len(skus_to_check)} 個商品不在官網列表中，需要確認")
             
             for sku in skus_to_check:
-                info = collection_products_full.get(sku, {})
+                info = ogura_skus_in_shopify.get(sku, {})
                 product_id = info.get('product_id')
                 current_status = info.get('status', 'active')
                 

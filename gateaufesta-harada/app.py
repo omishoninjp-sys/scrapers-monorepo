@@ -1326,6 +1326,24 @@ def run_scrape():
         scrape_status['running'] = False
         scrape_status['current_product'] = "完成"
 
+@app.route('/api/test-translate')
+def test_translate():
+    """測試翻譯功能"""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return jsonify({
+            'error': 'OPENAI_API_KEY 環境變數未設定',
+            'key_exists': False
+        })
+    
+    key_preview = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else "太短"
+    
+    result = translate_with_chatgpt("ゴーフル10S", "神戸の銘菓ゴーフルの詰め合わせです")
+    result['key_preview'] = key_preview
+    result['key_length'] = len(api_key)
+    
+    return jsonify(result)
+
 @app.route('/api/test-shopify')
 def test_shopify():
     if not load_shopify_token():

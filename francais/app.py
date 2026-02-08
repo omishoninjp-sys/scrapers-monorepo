@@ -971,6 +971,23 @@ def run_scrape():
                     scrape_status['deleted'] += 1
                 time.sleep(0.5)
 
+            # ★ 清理 Collection 內的お急ぎ便商品
+            scrape_status['current_product'] = "清理お急ぎ便商品..."
+            coll_url = shopify_api_url(f"collections/{collection_id}/products.json?limit=250")
+            while coll_url:
+                resp = requests.get(coll_url, headers=get_shopify_headers())
+                if resp.status_code != 200:
+                    break
+                for p in resp.json().get('products', []):
+                    if 'お急ぎ便' in p.get('title', ''):
+                        if set_product_to_draft(p['id']):
+                            scrape_status['deleted'] += 1
+                            print(f"[草稿] お急ぎ便: {p['title']}")
+                        time.sleep(0.5)
+                lh = resp.headers.get('Link', '')
+                m = re.search(r'<([^>]+)>; rel="next"', lh)
+                coll_url = m.group(1) if m and 'rel="next"' in lh else None
+
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})
     finally:

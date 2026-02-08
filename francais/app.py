@@ -372,7 +372,7 @@ def scrape_product_list():
 def scrape_product_detail(url):
     product = {
         'url': url, 'title': '', 'price': 0, 'description': '', 'box_size_text': '',
-        'weight': 0, 'images': [], 'in_stock': True, 'is_point_product': False,
+        'weight': 0, 'images': [], 'in_stock': True, 'is_point_product': False, 'is_express': False,
         'sku': '', 'sku_raw': '', 'content': '', 'allergens': '', 'shelf_life': ''
     }
     sku_match = re.search(r'/shop/g/g([^/]+)/?', url)
@@ -386,6 +386,9 @@ def scrape_product_detail(url):
         page_text = soup.get_text()
         title_el = soup.find('h1')
         if title_el: product['title'] = title_el.get_text(strip=True)
+        # お急ぎ便 檢測
+        if 'お急ぎ便' in product['title']:
+            product['is_express'] = True
         price_area = soup.find('div', class_='block-goods-price')
         if price_area and 'ポイント' in price_area.get_text():
             product['is_point_product'] = True
@@ -933,6 +936,9 @@ def run_scrape():
 
             if not product.get('in_stock', True): scrape_status['skipped'] += 1; continue
             if product.get('is_point_product', False): scrape_status['skipped'] += 1; continue
+            if product.get('is_express', False):
+                print(f"[跳過] お急ぎ便商品: {product.get('title', '')}")
+                scrape_status['skipped'] += 1; continue
             if product.get('price', 0) < MIN_PRICE:
                 scrape_status['filtered_by_price'] += 1; scrape_status['skipped'] += 1; continue
             if not product.get('title') or not product.get('price'):

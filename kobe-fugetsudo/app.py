@@ -1557,19 +1557,48 @@ def diagnose_page():
 
 @app.route('/api/scan-japanese')
 def api_scan_japanese():
-    """掃描日文商品 API"""
+    """掃描日文商品 API（只掃神戶風月堂）"""
     if not load_shopify_token():
         return jsonify({'error': '未設定 Shopify Token'}), 400
     
-    products = get_all_products_detailed()
+    # 只拉神戶風月堂的商品，避免 timeout
+    products = []
+    url = shopify_api_url("products.json?limit=250&vendor=神戶風月堂")
     
-    japanese_products = []
-    for p in products:
-        title = p.get('title', '')
-        sku = p.get('sku', '')
-        # 只掃描神戶風月堂的商品（SKU 以 FGT- 開頭）
-        if sku.startswith('FGT-') and is_japanese_text(title):
-            japanese_products.append(p)
+    while url:
+        response = requests.get(url, headers=get_shopify_headers())
+        if response.status_code != 200:
+            break
+        
+        data = response.json()
+        for p in data.get('products', []):
+            sku = ''
+            price = ''
+            for v in p.get('variants', []):
+                sku = v.get('sku', '')
+                price = v.get('price', '')
+                break
+            
+            products.append({
+                'id': p.get('id'),
+                'title': p.get('title', ''),
+                'handle': p.get('handle', ''),
+                'sku': sku,
+                'price': price,
+                'vendor': p.get('vendor', ''),
+                'status': p.get('status', ''),
+                'created_at': p.get('created_at', ''),
+                'image': p.get('image', {}).get('src', '') if p.get('image') else ''
+            })
+        
+        link_header = response.headers.get('Link', '')
+        if 'rel="next"' in link_header:
+            match = re.search(r'<([^>]+)>; rel="next"', link_header)
+            url = match.group(1) if match else None
+        else:
+            url = None
+    
+    japanese_products = [p for p in products if is_japanese_text(p.get('title', ''))]
     
     return jsonify({
         'total_products': len(products),

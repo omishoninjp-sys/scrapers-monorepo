@@ -114,7 +114,7 @@ def clean_html_for_translation(html_text):
     return text.strip()
 
 
-def translate_with_chatgpt(title, description):
+def translate_with_chatgpt(title, description, retry=False):
     clean_desc = clean_html_for_translation(description)
     clean_desc = re.sub(r'[\d,]+\s*円', '', clean_desc)
     clean_desc = re.sub(r'價格[：:]\s*[\d,]+\s*日圓', '', clean_desc)
@@ -128,7 +128,9 @@ def translate_with_chatgpt(title, description):
 回傳 JSON（不加 markdown）：
 {{"title":"名稱（前加 The maple mania 楓糖男孩）","description":"說明（HTML，不含價格）","page_title":"SEO標題50-60字","meta_description":"SEO描述100字內"}}
 
-規則：1.楓糖男孩東京伴手禮 2.開頭「The maple mania 楓糖男孩」3.禁止價格 4.只回傳JSON"""
+規則：1.楓糖男孩東京伴手禮 2.開頭「The maple mania 楓糖男孩」3.禁止價格 4.只回傳JSON 5.禁止日文"""
+    if retry:
+        prompt += "\n\n【嚴重警告】上次翻譯結果仍然包含日文字元（平假名/片假名）！這次你必須：\n1. 將所有日文平假名、片假名完全翻譯成繁體中文\n2. ごあいさつカード→問候卡、メープルギフト→楓糖禮盒、メープルマニアセレクション→楓糖男孩精選、詰合せ→綜合禮盒、ピスタチオ→開心果\n3. 絕對不可以出現任何 ひらがな 或 カタカナ\n4. 商品名中的日文必須全部意譯成中文"
 
     try:
         response = requests.post("https://api.openai.com/v1/chat/completions",
@@ -377,6 +379,18 @@ def upload_to_shopify(product, collection_id=None):
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
     if not translated['success']:
         return {'success': False, 'error': 'translation_failed', 'translated': translated}
+    if is_japanese_text(translated['title']):
+        print(f"[翻譯驗證] 標題仍含日文，重試加強翻譯: {translated['title']}")
+        retry = translate_with_chatgpt(
+            product['title'], product.get('description', ''),
+            retry=True
+        )
+        if retry['success'] and not is_japanese_text(retry['title']):
+            translated = retry
+            print(f"[翻譯驗證] 重試成功: {translated['title']}")
+        else:
+            print(f"[翻譯驗證] 重試仍含日文，視為失敗")
+            return {'success': False, 'error': 'translation_failed', 'translated': translated}
     cost = product['price']; weight = product.get('weight', 0)
     selling_price = calculate_selling_price(cost, weight)
     images_b64 = []
@@ -571,6 +585,12 @@ def api_retranslate_product():
     translated = translate_with_chatgpt(product.get('title', ''), product.get('body_html', ''))
     if not translated['success']:
         return jsonify({'success': False, 'error': f"翻譯失敗: {translated.get('error', '未知')}"})
+    if is_japanese_text(translated['title']):
+        retry_result = translate_with_chatgpt(product.get('title', ''), product.get('body_html', ''), retry=True)
+        if retry_result['success'] and not is_japanese_text(retry_result['title']):
+            translated = retry_result
+        else:
+            return jsonify({'success': False, 'error': '翻譯後仍含日文，請手動修改'})
     ok, r = update_product(pid, {
         'title': translated['title'],
         'body_html': translated['description'],

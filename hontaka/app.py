@@ -441,7 +441,7 @@ def index():
 <body>
 <div class="nav"><a href="/">🏠 首頁</a><a href="/japanese-scan">🇯🇵 日文掃描</a></div>
 <h1>🍪 本高砂屋 爬蟲工具 <small style="font-size:14px;color:#999">v2.1</small></h1>
-<div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:{{tc}};">{{ts}}</span></p>
+<div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:{tc};">{ts}</span></p>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
 <a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a></div>

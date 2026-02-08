@@ -1,5 +1,5 @@
 {
   "build_command": "pip install -r requirements.txt",
-  "start_command": "gunicorn app:app --bind 0.0.0.0:8080 --timeout 120",
+  "start_command": "gunicorn app:app --bind 0.0.0.0:8080 --timeout 600",
   "listen_port": 8080
 }

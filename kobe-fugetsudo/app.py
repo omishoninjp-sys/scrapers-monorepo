@@ -1566,7 +1566,9 @@ def api_scan_japanese():
     japanese_products = []
     for p in products:
         title = p.get('title', '')
-        if is_japanese_text(title):
+        sku = p.get('sku', '')
+        # 只掃描神戶風月堂的商品（SKU 以 FGT- 開頭）
+        if sku.startswith('FGT-') and is_japanese_text(title):
             japanese_products.append(p)
     
     return jsonify({

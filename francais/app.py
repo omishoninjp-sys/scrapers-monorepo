@@ -356,7 +356,9 @@ def scrape_product_list():
                 sku = normalize_sku(sku_raw)
                 if sku in seen_skus: continue
                 seen_skus.add(sku)
-                page_products.append({'url': urljoin(BASE_URL, href), 'sku': sku, 'sku_raw': sku_raw})
+                link_title = link.get('title', '') or link.get_text(strip=True)
+                is_express = 'お急ぎ便' in link_title
+                page_products.append({'url': urljoin(BASE_URL, href), 'sku': sku, 'sku_raw': sku_raw, 'is_express': is_express})
             products.extend(page_products)
             next_link = soup.find('a', href=re.compile(f'c10_p{page_num + 1}'))
             if next_link: page_num += 1
@@ -922,12 +924,17 @@ def run_scrape():
         scrape_status['total'] = len(product_list)
 
         website_skus = set(item['sku'] for item in product_list)
+        express_skus = set(item['sku'] for item in product_list if item.get('is_express'))
 
         consecutive_translation_failures = 0
 
         for idx, item in enumerate(product_list):
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理中: {item['sku']}"
+
+            # お急ぎ便商品：跳過（不爬詳細頁）
+            if item.get('is_express'):
+                scrape_status['skipped'] += 1; continue
 
             if item['sku'] in existing_skus:
                 scrape_status['skipped_exists'] += 1; scrape_status['skipped'] += 1; continue
@@ -936,9 +943,6 @@ def run_scrape():
 
             if not product.get('in_stock', True): scrape_status['skipped'] += 1; continue
             if product.get('is_point_product', False): scrape_status['skipped'] += 1; continue
-            if product.get('is_express', False):
-                print(f"[跳過] お急ぎ便商品: {product.get('title', '')}")
-                scrape_status['skipped'] += 1; continue
             if product.get('price', 0) < MIN_PRICE:
                 scrape_status['filtered_by_price'] += 1; scrape_status['skipped'] += 1; continue
             if not product.get('title') or not product.get('price'):
@@ -971,22 +975,14 @@ def run_scrape():
                     scrape_status['deleted'] += 1
                 time.sleep(0.5)
 
-            # ★ 清理 Collection 內的お急ぎ便商品
+            # ★ 清理お急ぎ便商品：用爬取時收集到的お急ぎ便 SKU 比對 Collection
             scrape_status['current_product'] = "清理お急ぎ便商品..."
-            coll_url = shopify_api_url(f"collections/{collection_id}/products.json?limit=250")
-            while coll_url:
-                resp = requests.get(coll_url, headers=get_shopify_headers())
-                if resp.status_code != 200:
-                    break
-                for p in resp.json().get('products', []):
-                    if 'お急ぎ便' in p.get('title', ''):
-                        if set_product_to_draft(p['id']):
-                            scrape_status['deleted'] += 1
-                            print(f"[草稿] お急ぎ便: {p['title']}")
-                        time.sleep(0.5)
-                lh = resp.headers.get('Link', '')
-                m = re.search(r'<([^>]+)>; rel="next"', lh)
-                coll_url = m.group(1) if m and 'rel="next"' in lh else None
+            for sku in express_skus:
+                pid = collection_products_map.get(sku)
+                if pid and set_product_to_draft(pid):
+                    scrape_status['deleted'] += 1
+                    print(f"[草稿] お急ぎ便 SKU: {sku}")
+                time.sleep(0.5)
 
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})

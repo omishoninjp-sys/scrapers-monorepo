@@ -127,7 +127,7 @@ def clean_html_for_translation(html_text):
     return text.strip()
 
 
-def translate_with_chatgpt(title, description):
+def translate_with_chatgpt(title, description, retry=False):
     clean_description = clean_html_for_translation(description)
     prompt = f"""你是專業的日本商品翻譯和 SEO 專家。請將以下日本甜點商品資訊翻譯成繁體中文，並優化 SEO。
 
@@ -149,7 +149,9 @@ def translate_with_chatgpt(title, description):
 4. 【禁止使用任何日文】所有內容必須是繁體中文或英文，不可出現任何日文字
 5. SEO 內容要包含：Francais、日本、千層派、伴手禮、送禮等關鍵字
 6. 日文詞彙翻譯對照：ミルフィユ→千層派、洋菓子→西式甜點、詰合せ→綜合禮盒
-7. 只回傳 JSON，不要其他文字"""
+7. 只回傳 JSON，不要其他文字"
+    if retry:
+        prompt += "\n\n【嚴重警告】上次翻譯結果仍然包含日文字元（平假名/片假名）！這次你必須：\n1. 將所有日文平假名、片假名完全翻譯成繁體中文\n2. ミルフィユ→千層派、洋菓子→西式甜點、詰合せ→綜合禮盒、果実→水果、贅沢→奢華\n3. 絕對不可以出現任何 ひらがな 或 カタカナ\n4. 商品名中的日文必須全部意譯成中文"""
 
     try:
         response = requests.post(
@@ -445,6 +447,20 @@ def upload_to_shopify(product, collection_id=None):
     if not translated['success']:
         print(f"[跳過-翻譯失敗] {product['sku']}: {translated.get('error', '未知錯誤')}")
         return {'success': False, 'error': 'translation_failed', 'translated': translated}
+
+    # ★ 翻譯驗證：檢查翻譯結果是否仍含日文
+    if is_japanese_text(translated['title']):
+        print(f"[翻譯驗證] 標題仍含日文，重試加強翻譯: {translated['title']}")
+        retry_result = translate_with_chatgpt(
+            product['title'], product.get('description', ''),
+            retry=True
+        )
+        if retry_result['success'] and not is_japanese_text(retry_result['title']):
+            translated = retry_result
+            print(f"[翻譯驗證] 重試成功: {translated['title']}")
+        else:
+            print(f"[翻譯驗證] 重試仍含日文，視為失敗")
+            return {'success': False, 'error': 'translation_failed', 'translated': translated}
 
     print(f"[翻譯成功] {translated['title'][:30]}...")
 
@@ -803,6 +819,12 @@ def api_retranslate_product():
     translated = translate_with_chatgpt(old_title, old_body)
     if not translated['success']:
         return jsonify({'success': False, 'error': f"翻譯失敗: {translated.get('error', '未知')}"})
+    if is_japanese_text(translated['title']):
+        retry_result = translate_with_chatgpt(old_title, old_body, retry=True)
+        if retry_result['success'] and not is_japanese_text(retry_result['title']):
+            translated = retry_result
+        else:
+            return jsonify({'success': False, 'error': '翻譯後仍含日文，請手動修改'})
     success, resp = update_product(product_id, {
         'title': translated['title'], 'body_html': translated['description'],
         'metafields_global_title_tag': translated['page_title'],

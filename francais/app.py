@@ -975,13 +975,13 @@ def run_scrape():
                     scrape_status['deleted'] += 1
                 time.sleep(0.5)
 
-            # ★ 清理お急ぎ便商品：用爬取時收集到的お急ぎ便 SKU 比對 Collection
+            # ★ 清理お急ぎ便商品：用爬取時收集到的お急ぎ便 SKU 比對 Shopify 商品
             scrape_status['current_product'] = "清理お急ぎ便商品..."
             for sku in express_skus:
-                pid = collection_products_map.get(sku)
+                pid = collection_products_map.get(sku) or all_products_map.get(sku)
                 if pid and set_product_to_draft(pid):
                     scrape_status['deleted'] += 1
-                    print(f"[草稿] お急ぎ便 SKU: {sku}")
+                    print(f"[草稿] お急ぎ便 SKU: {sku}, Product ID: {pid}")
                 time.sleep(0.5)
 
     except Exception as e:

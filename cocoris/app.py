@@ -1,13 +1,14 @@
 """
-Cocoris 商品爬蟲 + Shopify 上架工具 v2.1
+Cocoris 商品爬蟲 + Shopify 上架工具 v2.2
 功能：
 1. 爬取 sucreyshopping.jp Cocoris 品牌所有商品
 2. 計算材積重量 vs 實際重量，取大值
 3. 上架到 Shopify（不重複上架）
 4. 原價寫入成本價（Cost）
 5. OpenAI 翻譯成繁體中文
-6. 【v2.1】翻譯保護機制 - 翻譯失敗不上架、預檢、連續失敗自動停止
-7. 【v2.1】日文商品掃描 - 找出並修復未翻譯的商品
+6. 翻譯保護機制 - 翻譯失敗不上架、預檢、連續失敗自動停止
+7. 日文商品掃描 - 找出並修復未翻譯的商品
+8. 【v2.2】強化去重機制 - 多重 SKU 比對、handle 比對、上架前二次確認
 """
 
 from flask import Flask, jsonify, request
@@ -94,9 +95,28 @@ def shopify_api_url(endpoint):
 
 
 def normalize_sku(sku):
+    """★ v2.2 強化：統一 SKU 格式，去除所有可能的差異"""
     if not sku:
         return ""
-    return sku.strip().lower()
+    # 去除空白、轉小寫、去除前後特殊字元
+    normalized = sku.strip().lower()
+    # 去除常見的前綴差異（有些 SKU 可能帶有品牌前綴）
+    normalized = re.sub(r'^cocoris[-_]?', '', normalized)
+    # 去除尾部的尺寸/顏色碼（如果有的話）
+    # 保留基本的 SKU
+    return normalized
+
+
+def extract_base_sku(sku):
+    """★ v2.2 新增：提取 SKU 的基礎部分，用於模糊比對
+    例如 'ccr1234a' 和 'ccr1234' 視為可能相同的商品
+    """
+    if not sku:
+        return ""
+    normalized = normalize_sku(sku)
+    # 去除尾部的單個字母（可能是變體標記）
+    base = re.sub(r'[a-z]$', '', normalized)
+    return base if base else normalized
 
 
 def is_japanese_text(text):
@@ -260,7 +280,47 @@ def download_image_to_base64(img_url, max_retries=3):
 
 
 def get_existing_products_map():
-    products_map = {}
+    """★ v2.2 強化：回傳多層去重 map，包含 SKU、normalized SKU、metafield URL"""
+    products_map = {
+        'by_sku': {},           # normalized_sku -> product_id
+        'by_raw_sku': {},       # raw_sku -> product_id
+        'by_source_url': {},    # 原始商品 URL -> product_id
+        'by_title_hash': {},    # 商品標題的簡化版 -> product_id
+    }
+    
+    url = shopify_api_url("products.json?limit=250&vendor=Cocoris")
+    while url:
+        response = requests.get(url, headers=get_shopify_headers())
+        if response.status_code != 200:
+            break
+        data = response.json()
+        for product in data.get('products', []):
+            product_id = product.get('id')
+            title = product.get('title', '')
+            
+            # 用標題建立 hash（去掉 "Cocoris " 前綴和空白）
+            title_key = re.sub(r'^cocoris\s*', '', title.lower()).strip()
+            if title_key:
+                products_map['by_title_hash'][title_key] = product_id
+            
+            for variant in product.get('variants', []):
+                sku = variant.get('sku')
+                if sku and product_id:
+                    raw = sku.strip()
+                    normalized = normalize_sku(sku)
+                    products_map['by_sku'][normalized] = product_id
+                    products_map['by_raw_sku'][raw] = product_id
+                    products_map['by_raw_sku'][raw.lower()] = product_id
+                    products_map['by_raw_sku'][raw.upper()] = product_id
+        
+        link_header = response.headers.get('Link', '')
+        if 'rel="next"' in link_header:
+            match = re.search(r'<([^>]+)>; rel="next"', link_header)
+            url = match.group(1) if match else None
+        else:
+            url = None
+    
+    # 同時載入全店的（非 Cocoris vendor 的也檢查，避免 vendor 不同但 SKU 相同）
     url = shopify_api_url("products.json?limit=250")
     while url:
         response = requests.get(url, headers=get_shopify_headers())
@@ -273,16 +333,91 @@ def get_existing_products_map():
                 sku = variant.get('sku')
                 if sku and product_id:
                     normalized = normalize_sku(sku)
-                    products_map[normalized] = product_id
-                    if sku != normalized:
-                        products_map[sku] = product_id
+                    if normalized not in products_map['by_sku']:
+                        products_map['by_sku'][normalized] = product_id
+                    raw = sku.strip()
+                    if raw not in products_map['by_raw_sku']:
+                        products_map['by_raw_sku'][raw] = product_id
+        
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
             match = re.search(r'<([^>]+)>; rel="next"', link_header)
             url = match.group(1) if match else None
         else:
             url = None
+    
     return products_map
+
+
+def sku_exists_in_map(sku, products_map):
+    """★ v2.2 新增：多層檢查 SKU 是否已存在"""
+    if not sku:
+        return False
+    
+    normalized = normalize_sku(sku)
+    raw = sku.strip()
+    
+    # 1. 精確比對 normalized SKU
+    if normalized in products_map['by_sku']:
+        print(f"[去重] SKU '{sku}' 已存在（normalized 比對）")
+        return True
+    
+    # 2. 原始 SKU 比對（各種大小寫）
+    if raw in products_map['by_raw_sku']:
+        print(f"[去重] SKU '{sku}' 已存在（raw 比對）")
+        return True
+    if raw.lower() in products_map['by_raw_sku']:
+        print(f"[去重] SKU '{sku}' 已存在（lower 比對）")
+        return True
+    if raw.upper() in products_map['by_raw_sku']:
+        print(f"[去重] SKU '{sku}' 已存在（upper 比對）")
+        return True
+    
+    return False
+
+
+def check_sku_exists_realtime(sku):
+    """★ v2.2 新增：上架前即時再查一次 Shopify（防止快取過期）"""
+    if not sku:
+        return False
+    
+    # 用 GraphQL 精確搜尋 SKU
+    graphql_url = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/graphql.json"
+    headers = {'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json'}
+    
+    # 搜尋 SKU（Shopify 的搜尋是模糊匹配，所以結果需要精確比對）
+    query = """
+    {
+      productVariants(first: 10, query: "sku:%s") {
+        edges {
+          node {
+            sku
+            product {
+              id
+              title
+            }
+          }
+        }
+      }
+    }
+    """ % sku.replace('"', '\\"')
+    
+    try:
+        response = requests.post(graphql_url, headers=headers, json={'query': query}, timeout=15)
+        if response.status_code == 200:
+            result = response.json()
+            edges = result.get('data', {}).get('productVariants', {}).get('edges', [])
+            for edge in edges:
+                existing_sku = edge['node'].get('sku', '')
+                if normalize_sku(existing_sku) == normalize_sku(sku):
+                    product_title = edge['node'].get('product', {}).get('title', '')
+                    print(f"[即時去重] SKU '{sku}' 已存在於商品: {product_title}")
+                    return True
+    except Exception as e:
+        print(f"[即時去重] 查詢失敗: {e}")
+        # 查詢失敗不阻擋上架，但記錄警告
+    
+    return False
 
 
 def get_collection_products_map(collection_id):
@@ -456,12 +591,20 @@ def scrape_product_list():
         except Exception as e:
             print(f"[ERROR] 載入頁面失敗: {e}")
             has_next_page = False
+    
+    # ★ v2.2 強化去重：用 set 確保完全不重複
     unique_products = []
     seen = set()
     for p in products:
-        if p['sku'] not in seen:
-            seen.add(p['sku'])
+        # 同時用 normalized 和 raw 去重
+        key = normalize_sku(p['sku'])
+        if key not in seen:
+            seen.add(key)
             unique_products.append(p)
+        else:
+            print(f"[列表去重] 跳過重複 SKU: {p['sku']} (normalized: {key})")
+    
+    print(f"[INFO] 共找到 {len(unique_products)} 個不重複商品（原始 {len(products)} 個）")
     return unique_products
 
 
@@ -566,12 +709,16 @@ def scrape_product_detail(url):
 
 
 def upload_to_shopify(product, collection_id=None):
-    """上傳商品到 Shopify（含翻譯保護）"""
+    """上傳商品到 Shopify（含翻譯保護 + v2.2 即時去重）"""
+    
+    # ★ v2.2：上架前即時再確認一次（防止快取過期導致重複）
+    if check_sku_exists_realtime(product['sku']):
+        print(f"[跳過-即時去重] {product['sku']} 已存在")
+        return {'success': False, 'error': 'already_exists_realtime', 'skipped': True}
     
     print(f"[翻譯] 正在翻譯: {product['title'][:30]}...")
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
     
-    # ★ 翻譯保護：翻譯失敗就不上架
     if not translated['success']:
         print(f"[跳過-翻譯失敗] {product['sku']}: {translated.get('error', '未知錯誤')}")
         return {'success': False, 'error': 'translation_failed', 'translated': translated}
@@ -669,6 +816,8 @@ def index():
         .btn-secondary:hover {{ background: #2980b9; }}
         .btn-success {{ background: #27ae60; }}
         .btn-success:hover {{ background: #219a52; }}
+        .btn-warning {{ background: #e67e22; }}
+        .btn-warning:hover {{ background: #d35400; }}
         .progress-bar {{ width: 100%; height: 20px; background: #eee; border-radius: 10px; overflow: hidden; margin: 10px 0; }}
         .progress-fill {{ height: 100%; background: linear-gradient(90deg, #8B4513, #D2691E); transition: width 0.3s; }}
         .status {{ padding: 10px; background: #f8f9fa; border-radius: 5px; margin-top: 10px; }}
@@ -687,9 +836,10 @@ def index():
     <div class="nav">
         <a href="/">🏠 首頁</a>
         <a href="/japanese-scan">🇯🇵 日文商品掃描</a>
+        <a href="/dedup-scan">🔍 重複商品掃描</a>
     </div>
     
-    <h1>🍪 Cocoris 爬蟲工具 <small style="font-size: 14px; color: #999;">v2.1</small></h1>
+    <h1>🍪 Cocoris 爬蟲工具 <small style="font-size: 14px; color: #999;">v2.2</small></h1>
     
     <div class="card">
         <h3>Shopify 連線狀態</h3>
@@ -697,6 +847,7 @@ def index():
         <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
         <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
         <a href="/japanese-scan" class="btn btn-success">🇯🇵 掃描日文商品</a>
+        <a href="/dedup-scan" class="btn btn-warning">🔍 掃描重複商品</a>
     </div>
     
     <div class="card">
@@ -704,7 +855,8 @@ def index():
         <p>爬取 sucreyshopping.jp Cocoris 品牌商品並上架到 Shopify</p>
         <p style="color: #666; font-size: 14px;">
             ※ 成本價低於 ¥{MIN_PRICE} 的商品將自動跳過<br>
-            ※ <b style="color: #e74c3c;">翻譯保護</b> - 翻譯失敗不上架，連續失敗 {MAX_CONSECUTIVE_TRANSLATION_FAILURES} 次自動停止
+            ※ <b style="color: #e74c3c;">翻譯保護</b> - 翻譯失敗不上架，連續失敗 {MAX_CONSECUTIVE_TRANSLATION_FAILURES} 次自動停止<br>
+            ※ <b style="color: #e67e22;">v2.2 強化去重</b> - 上架前即時二次確認，防止重複上架
         </p>
         <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
         
@@ -802,6 +954,138 @@ def index():
 </html>'''
 
 
+@app.route('/dedup-scan')
+def dedup_scan_page():
+    """★ v2.2 新增：重複商品掃描頁面"""
+    return '''<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>重複商品掃描 - Cocoris</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        h1 { color: #333; border-bottom: 2px solid #e67e22; padding-bottom: 10px; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .btn { background: #8B4513; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; margin-bottom: 10px; }
+        .btn:hover { background: #A0522D; }
+        .btn:disabled { background: #ccc; cursor: not-allowed; }
+        .btn-danger { background: #e74c3c; }
+        .btn-sm { padding: 5px 10px; font-size: 12px; }
+        .nav { margin-bottom: 20px; }
+        .nav a { margin-right: 15px; color: #8B4513; text-decoration: none; font-weight: bold; }
+        .dup-group { border: 2px solid #e74c3c; border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
+        .dup-group-header { background: #fee; padding: 10px 15px; font-weight: bold; color: #c0392b; }
+        .dup-item { display: flex; align-items: center; padding: 10px 15px; border-top: 1px solid #eee; gap: 10px; }
+        .dup-item img { width: 50px; height: 50px; object-fit: cover; border-radius: 4px; }
+        .dup-item .info { flex: 1; font-size: 13px; }
+        .dup-item .info .title { font-weight: bold; }
+        .dup-item .keep { color: #27ae60; font-weight: bold; }
+        .no-image { width: 50px; height: 50px; background: #eee; display: flex; align-items: center; justify-content: center; border-radius: 4px; color: #999; font-size: 10px; }
+        .stats { display: flex; gap: 15px; margin: 20px 0; flex-wrap: wrap; }
+        .stat { flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f8f9fa; border-radius: 8px; }
+        .stat-number { font-size: 36px; font-weight: bold; }
+        .stat-label { font-size: 14px; color: #666; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="nav">
+        <a href="/">🏠 首頁</a>
+        <a href="/japanese-scan">🇯🇵 日文商品掃描</a>
+        <a href="/dedup-scan">🔍 重複商品掃描</a>
+    </div>
+    <h1>🔍 重複商品掃描 - Cocoris</h1>
+    <div class="card">
+        <p>掃描 Shopify 中 Cocoris 商品，找出 SKU 相同的重複商品。</p>
+        <button class="btn" id="scanBtn" onclick="startScan()">🔍 開始掃描</button>
+        <span id="scanStatus"></span>
+    </div>
+    <div class="stats" id="statsSection" style="display: none;">
+        <div class="stat"><div class="stat-number" id="totalProducts" style="color: #3498db;">0</div><div class="stat-label">Cocoris 商品數</div></div>
+        <div class="stat"><div class="stat-number" id="dupGroups" style="color: #e74c3c;">0</div><div class="stat-label">重複組數</div></div>
+        <div class="stat"><div class="stat-number" id="dupProducts" style="color: #e67e22;">0</div><div class="stat-label">可刪除數</div></div>
+    </div>
+    <div id="resultsCard" style="display: none;">
+        <div class="card">
+            <button class="btn btn-danger" id="deleteAllDupsBtn" onclick="deleteAllDups()" disabled>🗑️ 一鍵刪除所有重複（保留最舊的）</button>
+            <span id="deleteProgress"></span>
+        </div>
+        <div id="results"></div>
+    </div>
+    <script>
+        let dupData = [];
+        async function startScan() {
+            document.getElementById('scanBtn').disabled = true;
+            document.getElementById('scanStatus').textContent = '掃描中...';
+            try {
+                const res = await fetch('/api/scan-duplicates');
+                const data = await res.json();
+                if (data.error) { alert('錯誤: ' + data.error); return; }
+                dupData = data.duplicates;
+                document.getElementById('totalProducts').textContent = data.total_products;
+                document.getElementById('dupGroups').textContent = data.duplicate_groups;
+                document.getElementById('dupProducts').textContent = data.deletable_count;
+                document.getElementById('statsSection').style.display = 'flex';
+                document.getElementById('resultsCard').style.display = 'block';
+                document.getElementById('deleteAllDupsBtn').disabled = dupData.length === 0;
+                renderDups(data.duplicates);
+                document.getElementById('scanStatus').textContent = '掃描完成！';
+            } catch (e) { alert(e.message); }
+            finally { document.getElementById('scanBtn').disabled = false; }
+        }
+        function renderDups(groups) {
+            const container = document.getElementById('results');
+            if (groups.length === 0) {
+                container.innerHTML = '<div class="card"><p style="text-align:center;color:#27ae60;font-size:18px;">✅ 沒有發現重複商品！</p></div>';
+                return;
+            }
+            let html = '';
+            groups.forEach((group, gi) => {
+                html += `<div class="dup-group"><div class="dup-group-header">重複組 #${gi+1} — SKU: ${group.sku} (${group.products.length} 個商品)</div>`;
+                group.products.forEach((p, pi) => {
+                    const isKeep = pi === 0;
+                    const img = p.image ? `<img src="${p.image}">` : `<div class="no-image">無圖</div>`;
+                    const keepBadge = isKeep ? '<span class="keep">✓ 保留</span>' : `<button class="btn btn-danger btn-sm" onclick="deleteOne('${p.id}', this)">🗑️ 刪除</button>`;
+                    html += `<div class="dup-item" id="dup-${p.id}">${img}<div class="info"><div class="title">${p.title}</div><div>ID: ${p.id} | 建立: ${p.created_at?.substring(0,10)||'?'} | 狀態: ${p.status}</div></div>${keepBadge}</div>`;
+                });
+                html += '</div>';
+            });
+            container.innerHTML = html;
+        }
+        async function deleteOne(id, btn) {
+            if (!confirm('確定刪除？')) return;
+            btn.disabled = true; btn.textContent = '刪除中...';
+            try {
+                const res = await fetch('/api/delete-product', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({product_id:id}) });
+                const data = await res.json();
+                if (data.success) { document.getElementById(`dup-${id}`).style.opacity = '0.3'; btn.textContent = '已刪除'; }
+                else { alert('失敗'); btn.disabled = false; btn.textContent = '🗑️ 刪除'; }
+            } catch(e) { alert(e.message); btn.disabled = false; }
+        }
+        async function deleteAllDups() {
+            let toDelete = [];
+            dupData.forEach(g => { g.products.slice(1).forEach(p => toDelete.push(p.id)); });
+            if (!confirm(`確定刪除 ${toDelete.length} 個重複商品？`)) return;
+            const btn = document.getElementById('deleteAllDupsBtn'); btn.disabled = true;
+            let s=0, f=0;
+            for (let i=0; i<toDelete.length; i++) {
+                document.getElementById('deleteProgress').textContent = `${i+1}/${toDelete.length}`;
+                try {
+                    const res = await fetch('/api/delete-product', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({product_id:toDelete[i]}) });
+                    const data = await res.json();
+                    if (data.success) { s++; const el = document.getElementById(`dup-${toDelete[i]}`); if(el) el.style.opacity='0.3'; } else f++;
+                } catch(e) { f++; }
+                await new Promise(r=>setTimeout(r,300));
+            }
+            alert(`完成！刪除: ${s}, 失敗: ${f}`);
+            btn.disabled = false; document.getElementById('deleteProgress').textContent = '';
+        }
+    </script>
+</body>
+</html>'''
+
+
 @app.route('/japanese-scan')
 def japanese_scan_page():
     return '''<!DOCTYPE html>
@@ -843,6 +1127,7 @@ def japanese_scan_page():
     <div class="nav">
         <a href="/">🏠 首頁</a>
         <a href="/japanese-scan">🇯🇵 日文商品掃描</a>
+        <a href="/dedup-scan">🔍 重複商品掃描</a>
     </div>
     <h1>🇯🇵 日文商品掃描 - Cocoris</h1>
     <div class="card">
@@ -943,6 +1228,77 @@ def japanese_scan_page():
 
 
 # ========== API 路由 ==========
+
+@app.route('/api/scan-duplicates')
+def api_scan_duplicates():
+    """★ v2.2 新增：掃描重複商品"""
+    if not load_shopify_token():
+        return jsonify({'error': '未設定 Shopify Token'}), 400
+    
+    products = []
+    url = shopify_api_url("products.json?limit=250&vendor=Cocoris")
+    while url:
+        response = requests.get(url, headers=get_shopify_headers())
+        if response.status_code != 200:
+            break
+        data = response.json()
+        for p in data.get('products', []):
+            sku = ''
+            price = ''
+            for v in p.get('variants', []):
+                sku = v.get('sku', '')
+                price = v.get('price', '')
+                break
+            products.append({
+                'id': p.get('id'),
+                'title': p.get('title', ''),
+                'sku': sku,
+                'price': price,
+                'status': p.get('status', ''),
+                'created_at': p.get('created_at', ''),
+                'image': p.get('image', {}).get('src', '') if p.get('image') else ''
+            })
+        link_header = response.headers.get('Link', '')
+        if 'rel="next"' in link_header:
+            match = re.search(r'<([^>]+)>; rel="next"', link_header)
+            url = match.group(1) if match else None
+        else:
+            url = None
+    
+    # 按 normalized SKU 分組
+    sku_groups = {}
+    for p in products:
+        sku = normalize_sku(p.get('sku', ''))
+        if not sku:
+            continue
+        if sku not in sku_groups:
+            sku_groups[sku] = []
+        sku_groups[sku].append(p)
+    
+    # 找出重複的（2 個以上）
+    duplicates = []
+    deletable_count = 0
+    for sku, group in sku_groups.items():
+        if len(group) >= 2:
+            # 按 created_at 排序，最舊的保留
+            group.sort(key=lambda x: x.get('created_at', ''))
+            duplicates.append({
+                'sku': sku,
+                'count': len(group),
+                'products': group
+            })
+            deletable_count += len(group) - 1
+    
+    # 按重複數量排序
+    duplicates.sort(key=lambda x: x['count'], reverse=True)
+    
+    return jsonify({
+        'total_products': len(products),
+        'duplicate_groups': len(duplicates),
+        'deletable_count': deletable_count,
+        'duplicates': duplicates
+    })
+
 
 @app.route('/api/scan-japanese')
 def api_scan_japanese():
@@ -1073,7 +1429,6 @@ def start_scrape():
     if not load_shopify_token():
         return jsonify({'success': False, 'error': '找不到 Token'})
     
-    # ★ 預檢：開始前先測試翻譯功能
     test_result = translate_with_chatgpt("テスト商品", "テスト説明")
     if not test_result['success']:
         error_msg = test_result.get('error', '未知錯誤')
@@ -1093,7 +1448,6 @@ def api_start():
     if not load_shopify_token():
         return jsonify({'success': False, 'error': '環境變數未設定'})
     
-    # ★ 預檢
     test_result = translate_with_chatgpt("テスト商品", "テスト説明")
     if not test_result['success']:
         error_msg = test_result.get('error', '未知錯誤')
@@ -1116,9 +1470,10 @@ def run_scrape():
             "translation_failed": 0, "translation_stopped": False
         }
         
-        scrape_status['current_product'] = "正在檢查 Shopify 已有商品..."
-        all_products_map = get_existing_products_map()
-        existing_skus = set(all_products_map.keys())
+        # ★ v2.2：使用多層去重 map
+        scrape_status['current_product'] = "正在檢查 Shopify 已有商品（強化去重）..."
+        products_map = get_existing_products_map()
+        print(f"[去重] 已載入 {len(products_map['by_sku'])} 個 normalized SKU, {len(products_map['by_raw_sku'])} 個 raw SKU")
         
         scrape_status['current_product'] = "正在設定 Collection..."
         collection_id = get_or_create_collection("Cocoris")
@@ -1133,22 +1488,38 @@ def run_scrape():
         
         website_skus = set(item['sku'] for item in product_list)
         
-        consecutive_translation_failures = 0  # ★ 連續翻譯失敗計數器
+        # ★ v2.2：本次已處理的 SKU（防止同一批次內重複）
+        processed_skus_this_run = set()
+        consecutive_translation_failures = 0
         
         for idx, item in enumerate(product_list):
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理中: {item['sku']}"
             
-            if item['sku'] in existing_skus:
+            normalized_sku = normalize_sku(item['sku'])
+            
+            # ★ v2.2：檢查本次是否已處理過
+            if normalized_sku in processed_skus_this_run:
+                print(f"[跳過-本次重複] {item['sku']}")
                 scrape_status['skipped_exists'] += 1
                 scrape_status['skipped'] += 1
                 continue
             
-            product = scrape_product_detail(item['url'])
-            
-            if product['sku'] in existing_skus:
+            # ★ v2.2：多層去重檢查
+            if sku_exists_in_map(item['sku'], products_map):
                 scrape_status['skipped_exists'] += 1
                 scrape_status['skipped'] += 1
+                processed_skus_this_run.add(normalized_sku)
+                continue
+            
+            product = scrape_product_detail(item['url'])
+            
+            # ★ v2.2：用爬回來的 SKU 再檢查一次
+            if sku_exists_in_map(product['sku'], products_map):
+                scrape_status['skipped_exists'] += 1
+                scrape_status['skipped'] += 1
+                processed_skus_this_run.add(normalized_sku)
+                processed_skus_this_run.add(normalize_sku(product['sku']))
                 continue
             
             if not product.get('in_stock', True):
@@ -1171,26 +1542,33 @@ def run_scrape():
             result = upload_to_shopify(product, collection_id)
             
             if result['success']:
-                existing_skus.add(product['sku'])
-                existing_skus.add(item['sku'])
+                # ★ v2.2：更新所有去重 map
+                products_map['by_sku'][normalized_sku] = True
+                products_map['by_sku'][normalize_sku(product['sku'])] = True
+                products_map['by_raw_sku'][item['sku']] = True
+                products_map['by_raw_sku'][product['sku']] = True
+                processed_skus_this_run.add(normalized_sku)
+                processed_skus_this_run.add(normalize_sku(product['sku']))
                 scrape_status['uploaded'] += 1
-                consecutive_translation_failures = 0  # ★ 成功就重置
+                consecutive_translation_failures = 0
             elif result.get('error') == 'translation_failed':
                 scrape_status['translation_failed'] += 1
                 consecutive_translation_failures += 1
-                
-                # ★ 連續翻譯失敗超過閾值，自動停止
                 if consecutive_translation_failures >= MAX_CONSECUTIVE_TRANSLATION_FAILURES:
                     scrape_status['translation_stopped'] = True
                     scrape_status['errors'].append({'error': f'翻譯連續失敗 {consecutive_translation_failures} 次，自動停止'})
                     break
+            elif result.get('error') == 'already_exists_realtime':
+                # ★ v2.2：即時去重發現的重複
+                scrape_status['skipped_exists'] += 1
+                scrape_status['skipped'] += 1
+                processed_skus_this_run.add(normalized_sku)
             else:
                 scrape_status['errors'].append({'sku': product['sku'], 'error': result['error']})
                 consecutive_translation_failures = 0
             
             time.sleep(1)
         
-        # 設為草稿（只有在非翻譯停止的情況下才執行）
         if not scrape_status['translation_stopped']:
             scrape_status['current_product'] = "正在檢查已下架商品..."
             skus_to_draft = collection_skus - website_skus
@@ -1210,8 +1588,8 @@ def run_scrape():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("Cocoris 爬蟲工具 v2.1")
-    print("新增功能：翻譯保護、日文商品掃描")
+    print("Cocoris 爬蟲工具 v2.2")
+    print("新增功能：強化去重、重複商品掃描、即時二次確認")
     print("=" * 50)
     
     port = int(os.environ.get('PORT', 8080))

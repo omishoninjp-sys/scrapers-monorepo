@@ -589,7 +589,9 @@ def get_status():
     return jsonify(scrape_status)
 
 
-@app.route('/api/start', methods=['POST'])
+@app.route('/api/start', methods=['POST', 'GET'])
+@app.route('/api/start-scrape', methods=['POST', 'GET'])
+
 def api_start():
     global scrape_status
     if scrape_status['running']: return jsonify({'error': '爬取正在進行中'}), 400
@@ -599,11 +601,6 @@ def api_start():
         return jsonify({'error': f"翻譯功能異常: {test.get('error', '未知')}"}), 400
     threading.Thread(target=run_scrape).start()
     return jsonify({'message': '本高砂屋 爬蟲已啟動'})
-
-
-@app.route('/api/start-scrape', methods=['POST'])
-def start_scrape_route():
-    return api_start()
 
 
 @app.route('/api/test-shopify')

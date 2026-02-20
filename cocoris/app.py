@@ -1,5 +1,5 @@
 """
-Cocoris 商品爬蟲 + Shopify 上架工具 v2.2
+Cocoris 商品爬蟲 + Shopify 上架工具 v2.3
 功能：
 1. 爬取 sucreyshopping.jp Cocoris 品牌所有商品
 2. 計算材積重量 vs 實際重量，取大值
@@ -9,6 +9,7 @@ Cocoris 商品爬蟲 + Shopify 上架工具 v2.2
 6. 翻譯保護機制 - 翻譯失敗不上架、預檢、連續失敗自動停止
 7. 日文商品掃描 - 找出並修復未翻譯的商品
 8. 【v2.2】強化去重機制 - 多重 SKU 比對、handle 比對、上架前二次確認
+9. 【v2.3】缺貨商品自動刪除 - 官網消失或缺貨皆直接刪除
 """
 
 from flask import Flask, jsonify, request
@@ -98,23 +99,16 @@ def normalize_sku(sku):
     """★ v2.2 強化：統一 SKU 格式，去除所有可能的差異"""
     if not sku:
         return ""
-    # 去除空白、轉小寫、去除前後特殊字元
     normalized = sku.strip().lower()
-    # 去除常見的前綴差異（有些 SKU 可能帶有品牌前綴）
     normalized = re.sub(r'^cocoris[-_]?', '', normalized)
-    # 去除尾部的尺寸/顏色碼（如果有的話）
-    # 保留基本的 SKU
     return normalized
 
 
 def extract_base_sku(sku):
-    """★ v2.2 新增：提取 SKU 的基礎部分，用於模糊比對
-    例如 'ccr1234a' 和 'ccr1234' 視為可能相同的商品
-    """
+    """★ v2.2 新增：提取 SKU 的基礎部分，用於模糊比對"""
     if not sku:
         return ""
     normalized = normalize_sku(sku)
-    # 去除尾部的單個字母（可能是變體標記）
     base = re.sub(r'[a-z]$', '', normalized)
     return base if base else normalized
 
@@ -282,10 +276,10 @@ def download_image_to_base64(img_url, max_retries=3):
 def get_existing_products_map():
     """★ v2.2 強化：回傳多層去重 map，包含 SKU、normalized SKU、metafield URL"""
     products_map = {
-        'by_sku': {},           # normalized_sku -> product_id
-        'by_raw_sku': {},       # raw_sku -> product_id
-        'by_source_url': {},    # 原始商品 URL -> product_id
-        'by_title_hash': {},    # 商品標題的簡化版 -> product_id
+        'by_sku': {},
+        'by_raw_sku': {},
+        'by_source_url': {},
+        'by_title_hash': {},
     }
     
     url = shopify_api_url("products.json?limit=250&vendor=Cocoris")
@@ -298,7 +292,6 @@ def get_existing_products_map():
             product_id = product.get('id')
             title = product.get('title', '')
             
-            # 用標題建立 hash（去掉 "Cocoris " 前綴和空白）
             title_key = re.sub(r'^cocoris\s*', '', title.lower()).strip()
             if title_key:
                 products_map['by_title_hash'][title_key] = product_id
@@ -320,7 +313,6 @@ def get_existing_products_map():
         else:
             url = None
     
-    # 同時載入全店的（非 Cocoris vendor 的也檢查，避免 vendor 不同但 SKU 相同）
     url = shopify_api_url("products.json?limit=250")
     while url:
         response = requests.get(url, headers=get_shopify_headers())
@@ -357,12 +349,10 @@ def sku_exists_in_map(sku, products_map):
     normalized = normalize_sku(sku)
     raw = sku.strip()
     
-    # 1. 精確比對 normalized SKU
     if normalized in products_map['by_sku']:
         print(f"[去重] SKU '{sku}' 已存在（normalized 比對）")
         return True
     
-    # 2. 原始 SKU 比對（各種大小寫）
     if raw in products_map['by_raw_sku']:
         print(f"[去重] SKU '{sku}' 已存在（raw 比對）")
         return True
@@ -377,15 +367,13 @@ def sku_exists_in_map(sku, products_map):
 
 
 def check_sku_exists_realtime(sku):
-    """★ v2.2 新增：上架前即時再查一次 Shopify（防止快取過期）"""
+    """★ v2.2 新增：上架前即時再查一次 Shopify"""
     if not sku:
         return False
     
-    # 用 GraphQL 精確搜尋 SKU
     graphql_url = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/graphql.json"
     headers = {'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json'}
     
-    # 搜尋 SKU（Shopify 的搜尋是模糊匹配，所以結果需要精確比對）
     query = """
     {
       productVariants(first: 10, query: "sku:%s") {
@@ -415,7 +403,6 @@ def check_sku_exists_realtime(sku):
                     return True
     except Exception as e:
         print(f"[即時去重] 查詢失敗: {e}")
-        # 查詢失敗不阻擋上架，但記錄警告
     
     return False
 
@@ -592,11 +579,9 @@ def scrape_product_list():
             print(f"[ERROR] 載入頁面失敗: {e}")
             has_next_page = False
     
-    # ★ v2.2 強化去重：用 set 確保完全不重複
     unique_products = []
     seen = set()
     for p in products:
-        # 同時用 normalized 和 raw 去重
         key = normalize_sku(p['sku'])
         if key not in seen:
             seen.add(key)
@@ -711,7 +696,6 @@ def scrape_product_detail(url):
 def upload_to_shopify(product, collection_id=None):
     """上傳商品到 Shopify（含翻譯保護 + v2.2 即時去重）"""
     
-    # ★ v2.2：上架前即時再確認一次（防止快取過期導致重複）
     if check_sku_exists_realtime(product['sku']):
         print(f"[跳過-即時去重] {product['sku']} 已存在")
         return {'success': False, 'error': 'already_exists_realtime', 'skipped': True}
@@ -839,7 +823,7 @@ def index():
         <a href="/dedup-scan">🔍 重複商品掃描</a>
     </div>
     
-    <h1>🍪 Cocoris 爬蟲工具 <small style="font-size: 14px; color: #999;">v2.2</small></h1>
+    <h1>🍪 Cocoris 爬蟲工具 <small style="font-size: 14px; color: #999;">v2.3</small></h1>
     
     <div class="card">
         <h3>Shopify 連線狀態</h3>
@@ -856,7 +840,7 @@ def index():
         <p style="color: #666; font-size: 14px;">
             ※ 成本價低於 ¥{MIN_PRICE} 的商品將自動跳過<br>
             ※ <b style="color: #e74c3c;">翻譯保護</b> - 翻譯失敗不上架，連續失敗 {MAX_CONSECUTIVE_TRANSLATION_FAILURES} 次自動停止<br>
-            ※ <b style="color: #e67e22;">v2.2 強化去重</b> - 上架前即時二次確認，防止重複上架
+            ※ <b style="color: #e67e22;">v2.3 缺貨自動刪除</b> - 官網消失或缺貨的商品直接從 Shopify 刪除
         </p>
         <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
         
@@ -873,7 +857,7 @@ def index():
                 <div class="stat"><div class="stat-number" id="skippedCount">0</div><div class="stat-label">已跳過</div></div>
                 <div class="stat"><div class="stat-number" id="filteredCount">0</div><div class="stat-label">價格過濾</div></div>
                 <div class="stat"><div class="stat-number" id="translationFailedCount" style="color: #e74c3c;">0</div><div class="stat-label">翻譯失敗</div></div>
-                <div class="stat"><div class="stat-number" id="deletedCount" style="color: #e67e22;">0</div><div class="stat-label">設為草稿</div></div>
+                <div class="stat"><div class="stat-number" id="deletedCount" style="color: #e67e22;">0</div><div class="stat-label">已刪除</div></div>
                 <div class="stat"><div class="stat-number" id="errorCount" style="color: #e74c3c;">0</div><div class="stat-label">錯誤</div></div>
             </div>
         </div>
@@ -1231,7 +1215,6 @@ def japanese_scan_page():
 
 @app.route('/api/scan-duplicates')
 def api_scan_duplicates():
-    """★ v2.2 新增：掃描重複商品"""
     if not load_shopify_token():
         return jsonify({'error': '未設定 Shopify Token'}), 400
     
@@ -1265,7 +1248,6 @@ def api_scan_duplicates():
         else:
             url = None
     
-    # 按 normalized SKU 分組
     sku_groups = {}
     for p in products:
         sku = normalize_sku(p.get('sku', ''))
@@ -1275,12 +1257,10 @@ def api_scan_duplicates():
             sku_groups[sku] = []
         sku_groups[sku].append(p)
     
-    # 找出重複的（2 個以上）
     duplicates = []
     deletable_count = 0
     for sku, group in sku_groups.items():
         if len(group) >= 2:
-            # 按 created_at 排序，最舊的保留
             group.sort(key=lambda x: x.get('created_at', ''))
             duplicates.append({
                 'sku': sku,
@@ -1289,7 +1269,6 @@ def api_scan_duplicates():
             })
             deletable_count += len(group) - 1
     
-    # 按重複數量排序
     duplicates.sort(key=lambda x: x['count'], reverse=True)
     
     return jsonify({
@@ -1302,7 +1281,6 @@ def api_scan_duplicates():
 
 @app.route('/api/scan-japanese')
 def api_scan_japanese():
-    """掃描日文商品（只掃 Cocoris）"""
     if not load_shopify_token():
         return jsonify({'error': '未設定 Shopify Token'}), 400
     
@@ -1470,7 +1448,6 @@ def run_scrape():
             "translation_failed": 0, "translation_stopped": False
         }
         
-        # ★ v2.2：使用多層去重 map
         scrape_status['current_product'] = "正在檢查 Shopify 已有商品（強化去重）..."
         products_map = get_existing_products_map()
         print(f"[去重] 已載入 {len(products_map['by_sku'])} 個 normalized SKU, {len(products_map['by_raw_sku'])} 個 raw SKU")
@@ -1488,7 +1465,9 @@ def run_scrape():
         
         website_skus = set(item['sku'] for item in product_list)
         
-        # ★ v2.2：本次已處理的 SKU（防止同一批次內重複）
+        # === v2.3: 記錄缺貨的 SKU ===
+        out_of_stock_skus = set()
+        
         processed_skus_this_run = set()
         consecutive_translation_failures = 0
         
@@ -1498,15 +1477,22 @@ def run_scrape():
             
             normalized_sku = normalize_sku(item['sku'])
             
-            # ★ v2.2：檢查本次是否已處理過
+            # 檢查本次是否已處理過
             if normalized_sku in processed_skus_this_run:
                 print(f"[跳過-本次重複] {item['sku']}")
                 scrape_status['skipped_exists'] += 1
                 scrape_status['skipped'] += 1
                 continue
             
-            # ★ v2.2：多層去重檢查
+            # 多層去重檢查 — 已存在於 Shopify
             if sku_exists_in_map(item['sku'], products_map):
+                # === v2.3: 已存在的商品，如果在 collection 裡，爬詳情確認庫存 ===
+                if normalized_sku in collection_skus:
+                    product = scrape_product_detail(item['url'])
+                    if product and not product.get('in_stock', True):
+                        out_of_stock_skus.add(normalized_sku)
+                        print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                    time.sleep(0.5)
                 scrape_status['skipped_exists'] += 1
                 scrape_status['skipped'] += 1
                 processed_skus_this_run.add(normalized_sku)
@@ -1514,7 +1500,7 @@ def run_scrape():
             
             product = scrape_product_detail(item['url'])
             
-            # ★ v2.2：用爬回來的 SKU 再檢查一次
+            # 用爬回來的 SKU 再檢查一次
             if sku_exists_in_map(product['sku'], products_map):
                 scrape_status['skipped_exists'] += 1
                 scrape_status['skipped'] += 1
@@ -1522,8 +1508,11 @@ def run_scrape():
                 processed_skus_this_run.add(normalize_sku(product['sku']))
                 continue
             
+            # === v2.3: 缺貨 → 不上架，記錄 SKU ===
             if not product.get('in_stock', True):
+                out_of_stock_skus.add(normalized_sku)
                 scrape_status['skipped'] += 1
+                processed_skus_this_run.add(normalized_sku)
                 continue
             
             if product.get('is_point_product', False):
@@ -1542,7 +1531,6 @@ def run_scrape():
             result = upload_to_shopify(product, collection_id)
             
             if result['success']:
-                # ★ v2.2：更新所有去重 map
                 products_map['by_sku'][normalized_sku] = True
                 products_map['by_sku'][normalize_sku(product['sku'])] = True
                 products_map['by_raw_sku'][item['sku']] = True
@@ -1559,7 +1547,6 @@ def run_scrape():
                     scrape_status['errors'].append({'error': f'翻譯連續失敗 {consecutive_translation_failures} 次，自動停止'})
                     break
             elif result.get('error') == 'already_exists_realtime':
-                # ★ v2.2：即時去重發現的重複
                 scrape_status['skipped_exists'] += 1
                 scrape_status['skipped'] += 1
                 processed_skus_this_run.add(normalized_sku)
@@ -1570,14 +1557,24 @@ def run_scrape():
             time.sleep(1)
         
         if not scrape_status['translation_stopped']:
-            scrape_status['current_product'] = "正在檢查已下架商品..."
-            skus_to_draft = collection_skus - website_skus
-            if skus_to_draft:
-                for sku in skus_to_draft:
+            scrape_status['current_product'] = "清理缺貨/下架商品..."
+            
+            # === v2.3: 合併需要刪除的 SKU ===
+            # 1. 官網已消失的 SKU（collection 有但官網沒有）
+            # 2. 官網還在但缺貨的 SKU
+            skus_to_delete = (collection_skus - website_skus) | (collection_skus & out_of_stock_skus)
+            
+            if skus_to_delete:
+                print(f"[v2.3] 準備刪除 {len(skus_to_delete)} 個商品（官網消失: {len(collection_skus - website_skus)}, 缺貨: {len(collection_skus & out_of_stock_skus)}）")
+                for sku in skus_to_delete:
                     product_id = collection_products_map.get(sku)
-                    if product_id and set_product_to_draft(product_id):
-                        scrape_status['deleted'] += 1
-                    time.sleep(0.5)
+                    if product_id:
+                        if delete_product(product_id):
+                            scrape_status['deleted'] += 1
+                            print(f"[已刪除] SKU: {sku}, Product ID: {product_id}")
+                        else:
+                            scrape_status['errors'].append({'sku': sku, 'error': '刪除失敗'})
+                    time.sleep(0.3)
         
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})
@@ -1588,8 +1585,8 @@ def run_scrape():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("Cocoris 爬蟲工具 v2.2")
-    print("新增功能：強化去重、重複商品掃描、即時二次確認")
+    print("Cocoris 爬蟲工具 v2.3")
+    print("新增: 缺貨商品自動刪除（官網消失或缺貨皆刪除）")
     print("=" * 50)
     
     port = int(os.environ.get('PORT', 8080))

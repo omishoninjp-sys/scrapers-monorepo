@@ -1,5 +1,6 @@
 """
-坂角總本舖商品爬蟲 + Shopify 上架工具 v2.1
+坂角總本舖商品爬蟲 + Shopify 上架工具 v2.2
+v2.2: 缺貨商品自動刪除（官網消失或缺貨皆刪除）
 v2.1: 翻譯保護機制、日文商品掃描、測試翻譯
 """
 
@@ -341,15 +342,36 @@ def run_scrape():
         product_list = scrape_product_list(CATEGORY_URLS)
         scrape_status['total'] = len(product_list)
         website_skus = set(item['sku'] for item in product_list)
+
+        # === v2.2: 記錄缺貨的 SKU ===
+        out_of_stock_skus = set()
+
         ctf = 0
         for idx, item in enumerate(product_list):
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理: {item['sku']}"
-            if item['sku'] in existing_skus: scrape_status['skipped'] += 1; continue
+
+            # 已存在於 Shopify → 需要檢查庫存狀態
+            if item['sku'] in existing_skus:
+                # 如果這個 SKU 也在 collection 裡，爬詳情確認是否缺貨
+                if item['sku'] in collection_skus:
+                    product = scrape_product_detail(item['url'])
+                    if product and not product['in_stock']:
+                        out_of_stock_skus.add(item['sku'])
+                    time.sleep(0.5)
+                scrape_status['skipped'] += 1
+                continue
+
             product = scrape_product_detail(item['url'])
             if not product: scrape_status['errors'].append(f"無法爬取: {item['url']}"); continue
             if product['price'] < MIN_COST_THRESHOLD: scrape_status['filtered_by_price'] += 1; continue
-            if not product['in_stock']: scrape_status['skipped'] += 1; continue
+
+            # 缺貨 → 不上架，記錄 SKU
+            if not product['in_stock']:
+                out_of_stock_skus.add(item['sku'])
+                scrape_status['skipped'] += 1
+                continue
+
             result = upload_to_shopify(product, collection_id)
             if result['success']:
                 existing_skus.add(product['sku']); scrape_status['uploaded'] += 1; ctf = 0
@@ -361,12 +383,24 @@ def run_scrape():
             else:
                 scrape_status['errors'].append(f"上傳失敗 {product['sku']}"); ctf = 0
             time.sleep(1)
+
         if not scrape_status['translation_stopped']:
-            scrape_status['current_product'] = "檢查已下架商品..."
-            for sku in (collection_skus - website_skus):
+            scrape_status['current_product'] = "清理缺貨/下架商品..."
+
+            # === v2.2: 合併需要刪除的 SKU ===
+            # 1. 官網已消失的 SKU（collection 有但官網沒有）
+            # 2. 官網還在但缺貨的 SKU
+            skus_to_delete = (collection_skus - website_skus) | (collection_skus & out_of_stock_skus)
+
+            for sku in skus_to_delete:
                 pid = cpm.get(sku)
-                if pid and set_product_to_draft(pid): scrape_status['deleted'] += 1
+                if pid:
+                    if delete_product(pid):
+                        scrape_status['deleted'] += 1
+                    else:
+                        scrape_status['errors'].append(f"刪除失敗: {sku}")
                 time.sleep(0.3)
+
         scrape_status['current_product'] = "完成" if not scrape_status['translation_stopped'] else "翻譯異常停止"
     except Exception as e:
         scrape_status['errors'].append(str(e))
@@ -387,14 +421,14 @@ def index():
 <style>*{box-sizing:border-box}body{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f5}h1{color:#333;border-bottom:2px solid #D4AF37;padding-bottom:10px}.card{background:white;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}.btn{background:#D4AF37;color:white;border:none;padding:12px 24px;border-radius:5px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px;text-decoration:none;display:inline-block}.btn:hover{background:#B8972E}.btn:disabled{background:#ccc}.btn-secondary{background:#3498db}.btn-success{background:#27ae60}.progress-bar{width:100%;height:20px;background:#eee;border-radius:10px;overflow:hidden;margin:10px 0}.progress-fill{height:100%;background:linear-gradient(90deg,#D4AF37,#F0D078);transition:width 0.3s}.status{padding:10px;background:#f8f9fa;border-radius:5px;margin-top:10px}.log{max-height:300px;overflow-y:auto;font-family:monospace;font-size:13px;background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:5px}.stats{display:flex;gap:15px;margin-top:15px;flex-wrap:wrap}.stat{flex:1;min-width:70px;text-align:center;padding:15px;background:#f8f9fa;border-radius:5px}.stat-number{font-size:24px;font-weight:bold;color:#D4AF37}.stat-label{font-size:10px;color:#666;margin-top:5px}.nav{margin-bottom:20px}.nav a{margin-right:15px;color:#D4AF37;text-decoration:none;font-weight:bold}.alert{padding:12px 16px;border-radius:5px;margin-bottom:15px}.alert-danger{background:#fee;border:1px solid #fcc;color:#c0392b}</style></head>
 <body>
 <div class="nav"><a href="/">🏠 首頁</a><a href="/japanese-scan">🇯🇵 日文掃描</a></div>
-<h1>🦐 坂角總本舖 爬蟲工具 <small style="font-size:14px;color:#999">v2.1</small></h1>
+<h1>🦐 坂角總本舖 爬蟲工具 <small style="font-size:14px;color:#999">v2.2</small></h1>
 <div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:__TC__;">__TS__</span></p>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
 <a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a></div>
 <div class="card"><h3>開始爬取</h3>
 <p>爬取 bankaku.co.jp 全站商品並上架到 Shopify</p>
-<p style="color:#666;font-size:14px">※ &lt;¥__MIN_COST__ 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止</p>
+<p style="color:#666;font-size:14px">※ &lt;¥__MIN_COST__ 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止 | <b style="color:#e67e22">缺貨自動刪除</b></p>
 <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
 <div id="progressSection" style="display:none">
 <div id="translationAlert" class="alert alert-danger" style="display:none">⚠️ 翻譯功能異常，已自動停止！</div>
@@ -405,7 +439,7 @@ def index():
 <div class="stat"><div class="stat-number" id="skippedCount">0</div><div class="stat-label">已跳過</div></div>
 <div class="stat"><div class="stat-number" id="translationFailedCount" style="color:#e74c3c">0</div><div class="stat-label">翻譯失敗</div></div>
 <div class="stat"><div class="stat-number" id="filteredCount">0</div><div class="stat-label">價格過濾</div></div>
-<div class="stat"><div class="stat-number" id="deletedCount" style="color:#e67e22">0</div><div class="stat-label">設為草稿</div></div>
+<div class="stat"><div class="stat-number" id="deletedCount" style="color:#e67e22">0</div><div class="stat-label">已刪除</div></div>
 <div class="stat"><div class="stat-number" id="errorCount" style="color:#e74c3c">0</div><div class="stat-label">錯誤</div></div>
 </div></div></div>
 <div class="card"><h3>執行日誌</h3><div class="log" id="logArea">等待開始...</div></div>
@@ -537,8 +571,8 @@ def test_shopify():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("坂角總本舖爬蟲工具 v2.1")
-    print("新增: 翻譯保護、日文商品掃描")
+    print("坂角總本舖爬蟲工具 v2.2")
+    print("新增: 缺貨商品自動刪除")
     print("=" * 50)
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)

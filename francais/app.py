@@ -1,5 +1,5 @@
 """
-Francais フランセ 商品爬蟲 + Shopify 上架工具 v2.1
+Francais フランセ 商品爬蟲 + Shopify 上架工具 v2.2
 功能：
 1. 爬取 sucreyshopping.jp フランセ品牌所有商品
 2. 計算材積重量 vs 實際重量，取大值
@@ -8,6 +8,7 @@ Francais フランセ 商品爬蟲 + Shopify 上架工具 v2.1
 5. OpenAI 翻譯成繁體中文
 6. 【v2.1】翻譯保護機制 - 翻譯失敗不上架、預檢、連續失敗自動停止
 7. 【v2.1】日文商品掃描 - 找出並修復未翻譯的商品
+8. 【v2.2】缺貨商品自動刪除 - 官網消失、缺貨、お急ぎ便皆直接刪除
 """
 
 from flask import Flask, jsonify, request
@@ -388,7 +389,6 @@ def scrape_product_detail(url):
         page_text = soup.get_text()
         title_el = soup.find('h1')
         if title_el: product['title'] = title_el.get_text(strip=True)
-        # お急ぎ便 檢測
         if 'お急ぎ便' in product['title']:
             product['is_express'] = True
         price_area = soup.find('div', class_='block-goods-price')
@@ -444,22 +444,16 @@ def scrape_product_detail(url):
 
 
 def upload_to_shopify(product, collection_id=None):
-    """上傳商品到 Shopify（含翻譯保護）"""
     print(f"[翻譯] 正在翻譯: {product['title'][:30]}...")
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
 
-    # ★ 翻譯保護：翻譯失敗就不上架
     if not translated['success']:
         print(f"[跳過-翻譯失敗] {product['sku']}: {translated.get('error', '未知錯誤')}")
         return {'success': False, 'error': 'translation_failed', 'translated': translated}
 
-    # ★ 翻譯驗證：檢查翻譯結果是否仍含日文
     if is_japanese_text(translated['title']):
         print(f"[翻譯驗證] 標題仍含日文，重試加強翻譯: {translated['title']}")
-        retry_result = translate_with_chatgpt(
-            product['title'], product.get('description', ''),
-            retry=True
-        )
+        retry_result = translate_with_chatgpt(product['title'], product.get('description', ''), retry=True)
         if retry_result['success'] and not is_japanese_text(retry_result['title']):
             translated = retry_result
             print(f"[翻譯驗證] 重試成功: {translated['title']}")
@@ -555,7 +549,7 @@ def index():
         <a href="/">🏠 首頁</a>
         <a href="/japanese-scan">🇯🇵 日文商品掃描</a>
     </div>
-    <h1>🍰 Francais 爬蟲工具 <small style="font-size: 14px; color: #999;">v2.1</small></h1>
+    <h1>🍰 Francais 爬蟲工具 <small style="font-size: 14px; color: #999;">v2.2</small></h1>
     <div class="card">
         <h3>Shopify 連線狀態</h3>
         <p>Token: <span style="color: {token_color};">{token_status}</span></p>
@@ -568,7 +562,8 @@ def index():
         <p>爬取 sucreyshopping.jp Francais 品牌商品並上架到 Shopify</p>
         <p style="color: #666; font-size: 14px;">
             ※ 成本價低於 ¥{MIN_PRICE} 的商品將自動跳過<br>
-            ※ <b style="color: #e74c3c;">翻譯保護</b> - 翻譯失敗不上架，連續失敗 {MAX_CONSECUTIVE_TRANSLATION_FAILURES} 次自動停止
+            ※ <b style="color: #e74c3c;">翻譯保護</b> - 翻譯失敗不上架，連續失敗 {MAX_CONSECUTIVE_TRANSLATION_FAILURES} 次自動停止<br>
+            ※ <b style="color: #e67e22;">v2.2 缺貨自動刪除</b> - 官網消失、缺貨、お急ぎ便皆直接刪除
         </p>
         <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
         <div id="progressSection" style="display: none;">
@@ -580,7 +575,7 @@ def index():
                 <div class="stat"><div class="stat-number" id="skippedCount">0</div><div class="stat-label">已跳過</div></div>
                 <div class="stat"><div class="stat-number" id="filteredCount">0</div><div class="stat-label">價格過濾</div></div>
                 <div class="stat"><div class="stat-number" id="translationFailedCount" style="color: #e74c3c;">0</div><div class="stat-label">翻譯失敗</div></div>
-                <div class="stat"><div class="stat-number" id="deletedCount" style="color: #e67e22;">0</div><div class="stat-label">設為草稿</div></div>
+                <div class="stat"><div class="stat-number" id="deletedCount" style="color: #e67e22;">0</div><div class="stat-label">已刪除</div></div>
                 <div class="stat"><div class="stat-number" id="errorCount" style="color: #e74c3c;">0</div><div class="stat-label">錯誤</div></div>
             </div>
         </div>
@@ -876,7 +871,6 @@ def start_scrape():
     global scrape_status
     if scrape_status['running']: return jsonify({'success': False, 'error': '爬取正在進行中'})
     if not load_shopify_token(): return jsonify({'success': False, 'error': '找不到 Token'})
-    # ★ 預檢
     test_result = translate_with_chatgpt("テスト商品", "テスト説明")
     if not test_result['success']:
         return jsonify({'success': False, 'error': f"翻譯功能異常: {test_result.get('error', '未知')}"})
@@ -889,7 +883,6 @@ def api_start():
     global scrape_status
     if scrape_status['running']: return jsonify({'success': False, 'error': '爬取正在進行中'})
     if not load_shopify_token(): return jsonify({'success': False, 'error': '找不到設定'})
-    # ★ 預檢
     test_result = translate_with_chatgpt("テスト商品", "テスト説明")
     if not test_result['success']:
         return jsonify({'success': False, 'error': f"翻譯功能異常: {test_result.get('error', '未知')}"})
@@ -926,22 +919,41 @@ def run_scrape():
         website_skus = set(item['sku'] for item in product_list)
         express_skus = set(item['sku'] for item in product_list if item.get('is_express'))
 
+        # === v2.2: 記錄缺貨的 SKU ===
+        out_of_stock_skus = set()
+
         consecutive_translation_failures = 0
 
         for idx, item in enumerate(product_list):
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理中: {item['sku']}"
 
-            # お急ぎ便商品：跳過（不爬詳細頁）
+            # お急ぎ便商品：跳過不上架，記錄為需刪除
             if item.get('is_express'):
-                scrape_status['skipped'] += 1; continue
+                scrape_status['skipped'] += 1
+                continue
 
+            # 已存在於 Shopify
             if item['sku'] in existing_skus:
-                scrape_status['skipped_exists'] += 1; scrape_status['skipped'] += 1; continue
+                # === v2.2: 已上架商品檢查庫存 ===
+                if item['sku'] in collection_skus:
+                    product = scrape_product_detail(item['url'])
+                    if product and not product.get('in_stock', True):
+                        out_of_stock_skus.add(item['sku'])
+                        print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                    time.sleep(0.5)
+                scrape_status['skipped_exists'] += 1
+                scrape_status['skipped'] += 1
+                continue
 
             product = scrape_product_detail(item['url'])
 
-            if not product.get('in_stock', True): scrape_status['skipped'] += 1; continue
+            # === v2.2: 缺貨 → 不上架，記錄 SKU ===
+            if not product.get('in_stock', True):
+                out_of_stock_skus.add(item['sku'])
+                scrape_status['skipped'] += 1
+                continue
+
             if product.get('is_point_product', False): scrape_status['skipped'] += 1; continue
             if product.get('price', 0) < MIN_PRICE:
                 scrape_status['filtered_by_price'] += 1; scrape_status['skipped'] += 1; continue
@@ -968,21 +980,31 @@ def run_scrape():
             time.sleep(1)
 
         if not scrape_status['translation_stopped']:
-            scrape_status['current_product'] = "正在檢查已下架商品..."
-            for sku in (collection_skus - website_skus):
-                product_id = collection_products_map.get(sku)
-                if product_id and set_product_to_draft(product_id):
-                    scrape_status['deleted'] += 1
-                time.sleep(0.5)
+            scrape_status['current_product'] = "清理缺貨/下架/お急ぎ便商品..."
 
-            # ★ 清理お急ぎ便商品：用爬取時收集到的お急ぎ便 SKU 比對 Shopify 商品
-            scrape_status['current_product'] = "清理お急ぎ便商品..."
+            # === v2.2: 合併需要刪除的 SKU ===
+            # 1. 官網已消失的 SKU（collection 有但官網沒有）
+            # 2. 官網還在但缺貨的 SKU
+            # 3. お急ぎ便商品
+            skus_to_delete = (collection_skus - website_skus) | (collection_skus & out_of_stock_skus) | (collection_skus & express_skus)
+
+            # 也檢查 all_products_map 中的お急ぎ便（可能不在 collection 裡）
             for sku in express_skus:
-                pid = collection_products_map.get(sku) or all_products_map.get(sku)
-                if pid and set_product_to_draft(pid):
-                    scrape_status['deleted'] += 1
-                    print(f"[草稿] お急ぎ便 SKU: {sku}, Product ID: {pid}")
-                time.sleep(0.5)
+                pid = all_products_map.get(sku)
+                if pid and sku not in skus_to_delete:
+                    skus_to_delete.add(sku)
+
+            if skus_to_delete:
+                print(f"[v2.2] 準備刪除 {len(skus_to_delete)} 個商品")
+                for sku in skus_to_delete:
+                    pid = collection_products_map.get(sku) or all_products_map.get(sku)
+                    if pid:
+                        if delete_product(pid):
+                            scrape_status['deleted'] += 1
+                            print(f"[已刪除] SKU: {sku}, Product ID: {pid}")
+                        else:
+                            scrape_status['errors'].append({'sku': sku, 'error': '刪除失敗'})
+                    time.sleep(0.3)
 
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})
@@ -993,8 +1015,8 @@ def run_scrape():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("Francais 爬蟲工具 v2.1")
-    print("新增功能：翻譯保護、日文商品掃描")
+    print("Francais 爬蟲工具 v2.2")
+    print("新增: 缺貨商品自動刪除（官網消失、缺貨、お急ぎ便皆刪除）")
     print("=" * 50)
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)

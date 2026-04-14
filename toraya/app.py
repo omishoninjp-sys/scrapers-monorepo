@@ -1,7 +1,13 @@
 """
-虎屋羊羹商品爬蟲 + Shopify 上架工具 v2.2
+虎屋羊羹商品爬蟲 + Shopify 上架工具 v2.3
 v2.1: 翻譯保護機制、日文商品掃描、測試翻譯
 v2.2: 缺貨商品自動刪除 - 官網消失或缺貨皆直接刪除
+v2.3: 修復同步刪除 Bug
+  - 修復: scrape_shopify_products 分頁（原本只抓第一頁 30 筆）
+  - 修復: 空結果安全檢查（避免誤刪全部商品）
+  - 新增: 每日自動同步排程（預設 JST 10:00）
+  - 新增: /api/sync-delete 手動觸發僅刪除（不上架新品）
+  - 移除: 無效的 HTML fallback 爬蟲（JS 渲染頁面 BeautifulSoup 無法解析）
 """
 
 from flask import Flask, jsonify, request
@@ -28,6 +34,14 @@ DEFAULT_WEIGHT = 0.5
 MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
+# === v2.3: 安全閾值 ===
+# 如果從官網爬到的商品數量低於此值，視為爬蟲異常，跳過刪除步驟
+MIN_SCRAPED_PRODUCTS_FOR_DELETE = 5
+
+# === v2.3: 自動同步排程 ===
+AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "true").lower() == "true"
+AUTO_SYNC_HOUR = int(os.environ.get("AUTO_SYNC_HOUR", "10"))  # JST 10:00
+
 BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -42,6 +56,15 @@ scrape_status = {
     "products": [], "errors": [], "uploaded": 0, "skipped": 0,
     "filtered_by_price": 0, "out_of_stock": 0, "deleted": 0,
     "translation_failed": 0, "translation_stopped": False
+}
+
+# === v2.3: 最近一次同步刪除紀錄 ===
+last_sync_log = {
+    "last_run": None,
+    "website_skus_count": 0,
+    "collection_skus_count": 0,
+    "deleted_skus": [],
+    "errors": []
 }
 
 
@@ -293,35 +316,44 @@ def build_landing_html(translated_items):
     return html
 
 
-def scrape_product_list_selenium():
-    products = []
-    try:
-        r = session.get(PRODUCT_LIST_URL, timeout=30)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, 'html.parser')
-            seen = set()
-            for link in soup.find_all('a', href=re.compile(r'^/onlineshop/[^/]+$')):
-                href = link.get('href',''); handle = href.replace('/onlineshop/','')
-                if handle in ['all','product','products',''] or '/' in handle: continue
-                fu = urljoin(BASE_URL, href)
-                if fu not in seen: seen.add(fu); products.append({'url': fu, 'sku': f"toraya-{handle}", 'need_detail_scrape': True})
-    except: pass
-    return products
-
-
+# === v2.3: 修復分頁 — 爬取虎屋官方 Shopify 全部商品 ===
 def scrape_shopify_products():
+    """從虎屋 checkout Shopify API 爬取全部商品（含分頁）"""
     products = []
+    page = 1
+    max_pages = 20  # 安全上限
     try:
-        r = session.get(f"{CHECKOUT_URL}/products.json", timeout=30)
-        if r.status_code == 200:
-            for p in r.json().get('products', []):
-                handle = p.get('handle',''); variants = p.get('variants',[])
-                price = int(float(variants[0].get('price','0'))) if variants else 0
-                images = [img.get('src','') for img in p.get('images',[])]
-                products.append({'url': f"{BASE_URL}/onlineshop/{handle}", 'sku': f"toraya-{handle}",
-                    'title': p.get('title',''), 'price': price, 'description': '', 'images': images,
-                    'in_stock': True, 'weight': 0, 'need_detail_scrape': True})
-    except: pass
+        while page <= max_pages:
+            url = f"{CHECKOUT_URL}/products.json?page={page}&limit=250"
+            r = session.get(url, timeout=30)
+            if r.status_code != 200:
+                print(f"[v2.3] products.json page {page} 回傳 {r.status_code}")
+                break
+            page_products = r.json().get('products', [])
+            if not page_products:
+                break  # 沒有更多商品
+            for p in page_products:
+                handle = p.get('handle', '')
+                variants = p.get('variants', [])
+                price = int(float(variants[0].get('price', '0'))) if variants else 0
+                images = [img.get('src', '') for img in p.get('images', [])]
+                products.append({
+                    'url': f"{BASE_URL}/onlineshop/{handle}",
+                    'sku': f"toraya-{handle}",
+                    'title': p.get('title', ''),
+                    'price': price,
+                    'description': '',
+                    'images': images,
+                    'in_stock': True,
+                    'weight': 0,
+                    'need_detail_scrape': True
+                })
+            print(f"[v2.3] products.json page {page}: {len(page_products)} 筆商品")
+            page += 1
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"[v2.3] scrape_shopify_products 錯誤: {e}")
+    print(f"[v2.3] 虎屋官網共爬到 {len(products)} 筆商品")
     return products
 
 
@@ -419,6 +451,74 @@ def upload_to_shopify(product, collection_id=None):
     return {'success': False, 'error': r.text}
 
 
+# === v2.3: 獨立的同步刪除函式（可單獨呼叫）===
+def sync_delete_stale_products():
+    """比對官網商品清單，刪除已下架/缺貨/季節限定到期的商品"""
+    global last_sync_log
+    log = {"last_run": time.strftime("%Y-%m-%d %H:%M:%S"), "website_skus_count": 0,
+           "collection_skus_count": 0, "deleted_skus": [], "errors": []}
+    try:
+        if not load_shopify_token():
+            log["errors"].append("Shopify Token 未設定")
+            last_sync_log = log
+            return log
+
+        # 1. 爬取官網目前所有商品
+        product_list = scrape_shopify_products()
+        website_skus = set(item['sku'] for item in product_list)
+        log["website_skus_count"] = len(website_skus)
+        print(f"[v2.3 sync] 官網商品: {len(website_skus)} 筆")
+
+        # === v2.3: 安全檢查 — 爬蟲結果太少時跳過刪除 ===
+        if len(website_skus) < MIN_SCRAPED_PRODUCTS_FOR_DELETE:
+            msg = f"官網只爬到 {len(website_skus)} 筆商品（低於安全閾值 {MIN_SCRAPED_PRODUCTS_FOR_DELETE}），疑似爬蟲異常，跳過刪除"
+            print(f"[v2.3 sync] ⚠️ {msg}")
+            log["errors"].append(msg)
+            last_sync_log = log
+            return log
+
+        # 2. 取得 Shopify collection 中的商品
+        collection_id = get_or_create_collection("虎屋羊羹")
+        cpm = get_collection_products_map(collection_id)
+        collection_skus = set(cpm.keys())
+        log["collection_skus_count"] = len(collection_skus)
+        print(f"[v2.3 sync] Collection 商品: {len(collection_skus)} 筆")
+
+        # 3. 找出需要刪除的 SKU（在 collection 但不在官網）
+        skus_to_delete = collection_skus - website_skus
+
+        # 4. 額外檢查：在官網上標記缺貨的商品也刪除
+        for item in product_list:
+            if item['sku'] in collection_skus:
+                detail = scrape_product_detail_selenium(item['url'])
+                if detail and not detail.get('in_stock', True):
+                    skus_to_delete.add(item['sku'])
+                    print(f"[v2.3 sync] 缺貨: {item['sku']}")
+                time.sleep(0.5)
+
+        print(f"[v2.3 sync] 準備刪除 {len(skus_to_delete)} 筆: {skus_to_delete}")
+
+        # 5. 執行刪除
+        for sku in skus_to_delete:
+            pid = cpm.get(sku)
+            if pid:
+                if delete_product(pid):
+                    log["deleted_skus"].append(sku)
+                    print(f"[v2.3 sync] ✓ 已刪除 {sku} (ID: {pid})")
+                else:
+                    log["errors"].append(f"刪除失敗: {sku}")
+                    print(f"[v2.3 sync] ✗ 刪除失敗 {sku}")
+            time.sleep(0.3)
+
+        print(f"[v2.3 sync] 完成，共刪除 {len(log['deleted_skus'])} 筆")
+    except Exception as e:
+        log["errors"].append(str(e))
+        print(f"[v2.3 sync] 錯誤: {e}")
+
+    last_sync_log = log
+    return log
+
+
 def run_scrape():
     global scrape_status
     try:
@@ -437,13 +537,19 @@ def run_scrape():
         cpm = get_collection_products_map(collection_id)
         collection_skus = set(cpm.keys())
 
-        scrape_status['current_product'] = "爬取商品列表..."
+        scrape_status['current_product'] = "爬取虎屋官網商品列表..."
         product_list = scrape_shopify_products()
-        if not product_list: product_list = scrape_product_list_selenium()
+
+        # === v2.3: 移除無效的 HTML fallback，改為直接報錯 ===
+        if not product_list:
+            scrape_status['errors'].append("無法從虎屋官網取得商品列表（products.json 回傳空）")
+            scrape_status['current_product'] = "爬蟲失敗"
+            scrape_status['running'] = False
+            return
+
         scrape_status['total'] = len(product_list)
 
         website_skus = set(item['sku'] for item in product_list)
-        # === v2.2: 記錄缺貨的 SKU ===
         out_of_stock_skus = set()
         ctf = 0
 
@@ -452,7 +558,7 @@ def run_scrape():
             scrape_status['current_product'] = f"處理: {item.get('title', item['sku'])}"
 
             if item['sku'] in existing_skus:
-                # === v2.2: 已上架商品也爬詳情頁檢查庫存 ===
+                # 已上架商品也爬詳情頁檢查庫存
                 if item['sku'] in collection_skus:
                     detail = scrape_product_detail_selenium(item['url'])
                     if detail and not detail.get('in_stock', True):
@@ -481,7 +587,6 @@ def run_scrape():
             if item.get('price',0) < MIN_PRICE:
                 scrape_status['skipped'] += 1; continue
 
-            # === v2.2: 缺貨 → 記錄 SKU，不上架 ===
             if not item.get('in_stock', True):
                 out_of_stock_skus.add(item['sku'])
                 scrape_status['out_of_stock'] += 1
@@ -501,30 +606,65 @@ def run_scrape():
                 scrape_status['errors'].append(f"上傳失敗 {item['sku']}"); ctf = 0
             time.sleep(1)
 
-        # === v2.2: 合併需要刪除的 SKU ===
+        # === v2.3: 清理下架商品（含安全檢查）===
         if not scrape_status['translation_stopped']:
             scrape_status['current_product'] = "清理缺貨/下架商品..."
 
-            skus_to_delete = (collection_skus - website_skus) | (collection_skus & out_of_stock_skus)
+            # 安全檢查：爬到的商品數必須超過閾值
+            if len(website_skus) >= MIN_SCRAPED_PRODUCTS_FOR_DELETE:
+                skus_to_delete = (collection_skus - website_skus) | (collection_skus & out_of_stock_skus)
 
-            if skus_to_delete:
-                print(f"[v2.2] 準備刪除 {len(skus_to_delete)} 個商品")
-                for sku in skus_to_delete:
-                    scrape_status['current_product'] = f"刪除: {sku}"
-                    pid = cpm.get(sku)
-                    if pid:
-                        if delete_product(pid):
-                            scrape_status['deleted'] += 1
-                            print(f"[已刪除] SKU: {sku}, Product ID: {pid}")
-                        else:
-                            scrape_status['errors'].append(f"刪除失敗: {sku}")
-                    time.sleep(0.3)
+                if skus_to_delete:
+                    print(f"[v2.3] 準備刪除 {len(skus_to_delete)} 個商品: {skus_to_delete}")
+                    for sku in skus_to_delete:
+                        scrape_status['current_product'] = f"刪除: {sku}"
+                        pid = cpm.get(sku)
+                        if pid:
+                            if delete_product(pid):
+                                scrape_status['deleted'] += 1
+                                print(f"[已刪除] SKU: {sku}, Product ID: {pid}")
+                            else:
+                                scrape_status['errors'].append(f"刪除失敗: {sku}")
+                        time.sleep(0.3)
+            else:
+                msg = f"⚠️ 官網只爬到 {len(website_skus)} 筆（安全閾值 {MIN_SCRAPED_PRODUCTS_FOR_DELETE}），跳過刪除"
+                scrape_status['errors'].append(msg)
+                print(f"[v2.3] {msg}")
 
         scrape_status['current_product'] = "完成" if not scrape_status['translation_stopped'] else "翻譯異常停止"
     except Exception as e:
         scrape_status['errors'].append(str(e))
     finally:
         scrape_status['running'] = False
+
+
+# === v2.3: 自動同步排程 ===
+def start_auto_sync_scheduler():
+    """每 24 小時執行一次同步刪除（僅清理，不上架新品）"""
+    import datetime
+    def scheduler_loop():
+        while True:
+            try:
+                # 計算距離下一個目標時間的秒數 (JST = UTC+9)
+                import datetime as dt
+                now_utc = dt.datetime.utcnow()
+                now_jst = now_utc + dt.timedelta(hours=9)
+                target_jst = now_jst.replace(hour=AUTO_SYNC_HOUR, minute=0, second=0, microsecond=0)
+                if now_jst >= target_jst:
+                    target_jst += dt.timedelta(days=1)
+                wait_seconds = (target_jst - now_jst).total_seconds()
+                print(f"[v2.3 scheduler] 下次自動同步: {target_jst.strftime('%Y-%m-%d %H:%M')} JST（{int(wait_seconds)}秒後）")
+                time.sleep(wait_seconds)
+                print(f"[v2.3 scheduler] 開始自動同步刪除...")
+                result = sync_delete_stale_products()
+                print(f"[v2.3 scheduler] 自動同步完成: 刪除 {len(result.get('deleted_skus',[]))} 筆")
+            except Exception as e:
+                print(f"[v2.3 scheduler] 排程錯誤: {e}")
+                time.sleep(3600)  # 出錯等 1 小時再試
+
+    t = threading.Thread(target=scheduler_loop, daemon=True)
+    t.start()
+    print(f"[v2.3] 自動同步排程已啟動（每日 JST {AUTO_SYNC_HOUR}:00）")
 
 
 # ========== Flask 路由 ==========
@@ -537,16 +677,22 @@ def index():
     html = """<!DOCTYPE html>
 <html lang="zh-TW">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>虎屋羊羹 爬蟲工具</title>
-<style>*{box-sizing:border-box}body{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f5}h1{color:#333;border-bottom:2px solid #2F4F4F;padding-bottom:10px}.card{background:white;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}.btn{background:#2F4F4F;color:white;border:none;padding:12px 24px;border-radius:5px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px;text-decoration:none;display:inline-block}.btn:hover{background:#1F3F3F}.btn:disabled{background:#ccc}.btn-secondary{background:#3498db}.btn-success{background:#27ae60}.progress-bar{width:100%;height:20px;background:#eee;border-radius:10px;overflow:hidden;margin:10px 0}.progress-fill{height:100%;background:linear-gradient(90deg,#2F4F4F,#5F8F8F);transition:width 0.3s}.status{padding:10px;background:#f8f9fa;border-radius:5px;margin-top:10px}.log{max-height:300px;overflow-y:auto;font-family:monospace;font-size:13px;background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:5px}.stats{display:flex;gap:15px;margin-top:15px;flex-wrap:wrap}.stat{flex:1;min-width:70px;text-align:center;padding:15px;background:#f8f9fa;border-radius:5px}.stat-number{font-size:24px;font-weight:bold;color:#2F4F4F}.stat-label{font-size:10px;color:#666;margin-top:5px}.nav{margin-bottom:20px}.nav a{margin-right:15px;color:#2F4F4F;text-decoration:none;font-weight:bold}.alert{padding:12px 16px;border-radius:5px;margin-bottom:15px}.alert-danger{background:#fee;border:1px solid #fcc;color:#c0392b}</style></head>
+<style>*{box-sizing:border-box}body{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f5}h1{color:#333;border-bottom:2px solid #2F4F4F;padding-bottom:10px}.card{background:white;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}.btn{background:#2F4F4F;color:white;border:none;padding:12px 24px;border-radius:5px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px;text-decoration:none;display:inline-block}.btn:hover{background:#1F3F3F}.btn:disabled{background:#ccc}.btn-secondary{background:#3498db}.btn-success{background:#27ae60}.btn-warning{background:#e67e22}.progress-bar{width:100%;height:20px;background:#eee;border-radius:10px;overflow:hidden;margin:10px 0}.progress-fill{height:100%;background:linear-gradient(90deg,#2F4F4F,#5F8F8F);transition:width 0.3s}.status{padding:10px;background:#f8f9fa;border-radius:5px;margin-top:10px}.log{max-height:300px;overflow-y:auto;font-family:monospace;font-size:13px;background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:5px}.stats{display:flex;gap:15px;margin-top:15px;flex-wrap:wrap}.stat{flex:1;min-width:70px;text-align:center;padding:15px;background:#f8f9fa;border-radius:5px}.stat-number{font-size:24px;font-weight:bold;color:#2F4F4F}.stat-label{font-size:10px;color:#666;margin-top:5px}.nav{margin-bottom:20px}.nav a{margin-right:15px;color:#2F4F4F;text-decoration:none;font-weight:bold}.alert{padding:12px 16px;border-radius:5px;margin-bottom:15px}.alert-danger{background:#fee;border:1px solid #fcc;color:#c0392b}.alert-info{background:#e8f4fd;border:1px solid #b8daff;color:#004085}</style></head>
 <body>
 <div class="nav"><a href="/">🏠 首頁</a><a href="/japanese-scan">🇯🇵 日文掃描</a></div>
-<h1>🍡 虎屋羊羹 爬蟲工具 <small style="font-size:14px;color:#999">v2.2</small></h1>
+<h1>🍡 虎屋羊羹 爬蟲工具 <small style="font-size:14px;color:#999">v2.3</small></h1>
 <div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:__TC__;">__TS__</span></p>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
 <a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a></div>
-<div class="card"><h3>開始爬取</h3>
-<p style="color:#666;font-size:14px">※ &lt;¥1000 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止 | <b style="color:#e67e22">缺貨自動刪除</b></p>
+<div class="card"><h3>🔄 同步清理（僅刪除下架商品）</h3>
+<p style="color:#666;font-size:14px">※ 比對虎屋官網，刪除已下架/缺貨/季節限定到期的商品。不會上架新品。<br>
+⏰ 自動排程：每日 JST __SYNC_HOUR__:00（__AUTO_SYNC__）</p>
+<button class="btn btn-warning" id="syncBtn" onclick="syncDelete()">🧹 立即同步清理</button>
+<div id="syncResult" style="display:none;margin-top:15px"></div></div>
+<div class="card"><h3>🚀 完整爬取（含上架新品）</h3>
+<p style="color:#666;font-size:14px">※ &lt;¥1000 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止 | <b style="color:#e67e22">缺貨自動刪除</b><br>
+⚡ 安全閾值：官網商品 &lt; __MIN_SAFE__ 筆時跳過刪除（防止爬蟲異常誤刪）</p>
 <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
 <div id="progressSection" style="display:none">
 <div id="translationAlert" class="alert alert-danger" style="display:none">⚠️ 翻譯功能異常，已自動停止！</div>
@@ -562,8 +708,13 @@ def index():
 <div class="stat"><div class="stat-number" id="errorCount" style="color:#e74c3c">0</div><div class="stat-label">錯誤</div></div>
 </div></div></div>
 <div class="card"><h3>執行日誌</h3><div class="log" id="logArea">等待開始...</div></div>
-<script>let pollInterval=null;function log(m,t){const l=document.getElementById('logArea');const tm=new Date().toLocaleTimeString();const c={success:'#4ec9b0',error:'#f14c4c'}[t]||'#d4d4d4';l.innerHTML+='<div style="color:'+c+'">['+tm+'] '+m+'</div>';l.scrollTop=l.scrollHeight}function clearLog(){document.getElementById('logArea').innerHTML=''}async function testShopify(){log('測試連線...');try{const r=await fetch('/api/test-shopify');const d=await r.json();if(d.success)log('✓ '+d.shop.name,'success');else log('✗ '+d.error,'error')}catch(e){log('✗ '+e.message,'error')}}async function testTranslate(){log('測試翻譯...');try{const r=await fetch('/api/test-translate');const d=await r.json();if(d.error)log('✗ '+d.error,'error');else if(d.success)log('✓ '+d.title,'success');else log('✗ 翻譯失敗','error')}catch(e){log('✗ '+e.message,'error')}}async function startScrape(){clearLog();log('開始爬取...');document.getElementById('startBtn').disabled=true;document.getElementById('progressSection').style.display='block';document.getElementById('translationAlert').style.display='none';try{const r=await fetch('/api/start',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');document.getElementById('startBtn').disabled=false;return}log('✓ 已啟動','success');pollInterval=setInterval(pollStatus,1000)}catch(e){log('✗ '+e.message,'error');document.getElementById('startBtn').disabled=false}}async function pollStatus(){try{const r=await fetch('/api/status');const d=await r.json();const p=d.total>0?(d.progress/d.total*100):0;document.getElementById('progressFill').style.width=p+'%';document.getElementById('statusText').textContent=d.current_product+' ('+d.progress+'/'+d.total+')';document.getElementById('uploadedCount').textContent=d.uploaded;document.getElementById('skippedCount').textContent=d.skipped;document.getElementById('translationFailedCount').textContent=d.translation_failed||0;document.getElementById('filteredCount').textContent=d.filtered_by_price||0;document.getElementById('outOfStockCount').textContent=d.out_of_stock||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors.length;if(d.translation_stopped)document.getElementById('translationAlert').style.display='block';if(!d.running&&d.progress>0){clearInterval(pollInterval);document.getElementById('startBtn').disabled=false;if(d.translation_stopped)log('⚠️ 翻譯異常停止','error');else log('========== 完成 ==========','success')}}catch(e){console.error(e)}}</script></body></html>"""
-    return html.replace('__TC__', tc).replace('__TS__', ts).replace('__MIN_COST__', str(MIN_PRICE)).replace('__MAX_FAIL__', str(MAX_CONSECUTIVE_TRANSLATION_FAILURES))
+<script>let pollInterval=null;function log(m,t){const l=document.getElementById('logArea');const tm=new Date().toLocaleTimeString();const c={success:'#4ec9b0',error:'#f14c4c',warning:'#e67e22'}[t]||'#d4d4d4';l.innerHTML+='<div style="color:'+c+'">['+tm+'] '+m+'</div>';l.scrollTop=l.scrollHeight}function clearLog(){document.getElementById('logArea').innerHTML=''}async function testShopify(){log('測試連線...');try{const r=await fetch('/api/test-shopify');const d=await r.json();if(d.success)log('✓ '+d.shop.name,'success');else log('✗ '+d.error,'error')}catch(e){log('✗ '+e.message,'error')}}async function testTranslate(){log('測試翻譯...');try{const r=await fetch('/api/test-translate');const d=await r.json();if(d.error)log('✗ '+d.error,'error');else if(d.success)log('✓ '+d.title,'success');else log('✗ 翻譯失敗','error')}catch(e){log('✗ '+e.message,'error')}}async function syncDelete(){const b=document.getElementById('syncBtn');const rd=document.getElementById('syncResult');b.disabled=true;b.textContent='同步中...';rd.style.display='none';log('開始同步清理...','warning');try{const r=await fetch('/api/sync-delete',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');rd.innerHTML='<div class="alert alert-danger">❌ '+d.error+'</div>';rd.style.display='block'}else{const del_count=d.deleted_skus?d.deleted_skus.length:0;const msg=`✓ 同步完成：官網 ${d.website_skus_count} 筆 / Collection ${d.collection_skus_count} 筆 / 刪除 ${del_count} 筆`;log(msg,'success');if(d.deleted_skus&&d.deleted_skus.length>0)d.deleted_skus.forEach(s=>log('  刪除: '+s,'warning'));if(d.errors&&d.errors.length>0)d.errors.forEach(e=>log('  ⚠️ '+e,'error'));let html='<div class="alert alert-info">'+msg+'</div>';if(del_count>0)html+='<p>刪除的 SKU: '+d.deleted_skus.join(', ')+'</p>';rd.innerHTML=html;rd.style.display='block'}}catch(e){log('✗ '+e.message,'error')}finally{b.disabled=false;b.textContent='🧹 立即同步清理'}}async function startScrape(){clearLog();log('開始爬取...');document.getElementById('startBtn').disabled=true;document.getElementById('progressSection').style.display='block';document.getElementById('translationAlert').style.display='none';try{const r=await fetch('/api/start',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');document.getElementById('startBtn').disabled=false;return}log('✓ 已啟動','success');pollInterval=setInterval(pollStatus,1000)}catch(e){log('✗ '+e.message,'error');document.getElementById('startBtn').disabled=false}}async function pollStatus(){try{const r=await fetch('/api/status');const d=await r.json();const p=d.total>0?(d.progress/d.total*100):0;document.getElementById('progressFill').style.width=p+'%';document.getElementById('statusText').textContent=d.current_product+' ('+d.progress+'/'+d.total+')';document.getElementById('uploadedCount').textContent=d.uploaded;document.getElementById('skippedCount').textContent=d.skipped;document.getElementById('translationFailedCount').textContent=d.translation_failed||0;document.getElementById('filteredCount').textContent=d.filtered_by_price||0;document.getElementById('outOfStockCount').textContent=d.out_of_stock||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors.length;if(d.translation_stopped)document.getElementById('translationAlert').style.display='block';if(!d.running&&d.progress>0){clearInterval(pollInterval);document.getElementById('startBtn').disabled=false;if(d.translation_stopped)log('⚠️ 翻譯異常停止','error');else log('========== 完成 ==========','success')}}catch(e){console.error(e)}}</script></body></html>"""
+    return (html.replace('__TC__', tc).replace('__TS__', ts)
+            .replace('__MIN_COST__', str(MIN_PRICE))
+            .replace('__MAX_FAIL__', str(MAX_CONSECUTIVE_TRANSLATION_FAILURES))
+            .replace('__MIN_SAFE__', str(MIN_SCRAPED_PRODUCTS_FOR_DELETE))
+            .replace('__SYNC_HOUR__', str(AUTO_SYNC_HOUR))
+            .replace('__AUTO_SYNC__', '已啟用' if AUTO_SYNC_ENABLED else '未啟用'))
 
 
 @app.route('/japanese-scan')
@@ -580,6 +731,8 @@ def japanese_scan_page():
 <div class="card" id="resultsCard" style="display:none"><div class="action-bar"><div><button class="btn btn-success" id="retranslateAllBtn" onclick="retranslateAll()" disabled>🔄 全部翻譯</button><button class="btn btn-danger" id="deleteAllBtn" onclick="deleteAllJP()" disabled>🗑️ 全部刪除</button></div><div id="progressText"></div></div><div id="results"></div></div>
 <script>let jp=[];async function startScan(){document.getElementById('scanBtn').disabled=true;document.getElementById('scanStatus').textContent='掃描中...';try{const r=await fetch('/api/scan-japanese');const d=await r.json();if(d.error){alert(d.error);return}jp=d.japanese_products;document.getElementById('totalProducts').textContent=d.total_products;document.getElementById('japaneseCount').textContent=d.japanese_count;document.getElementById('statsSection').style.display='flex';renderResults(d.japanese_products);document.getElementById('resultsCard').style.display='block';document.getElementById('retranslateAllBtn').disabled=jp.length===0;document.getElementById('deleteAllBtn').disabled=jp.length===0;document.getElementById('scanStatus').textContent='完成！'}catch(e){alert(e.message)}finally{document.getElementById('scanBtn').disabled=false}}function renderResults(p){const c=document.getElementById('results');if(!p.length){c.innerHTML='<p style="text-align:center;color:#27ae60;font-size:18px">✅ 沒有日文商品</p>';return}let h='';p.forEach(i=>{const img=i.image?`<img src="${i.image}">`:`<div class="no-image">無圖</div>`;h+=`<div class="product-item" id="product-${i.id}">${img}<div class="info"><div class="title">${i.title}</div><div class="meta">SKU:${i.sku||'無'}|¥${i.price}|${i.status}</div><div class="retranslate-status" id="status-${i.id}"></div></div><div class="actions"><button class="btn btn-success btn-sm" onclick="rt1('${i.id}')" id="rt-${i.id}">🔄</button><button class="btn btn-danger btn-sm" onclick="del1('${i.id}')" id="del-${i.id}">🗑️</button></div></div>`});c.innerHTML=h}async function rt1(id){const b=document.getElementById(`rt-${id}`);const s=document.getElementById(`status-${id}`);b.disabled=true;b.textContent='...';try{const r=await fetch('/api/retranslate-product',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:id})});const d=await r.json();if(d.success){s.innerHTML=`<span style="color:#27ae60">✅ ${d.new_title}</span>`;const t=document.querySelector(`#product-${id} .title`);if(t){t.textContent=d.new_title;t.style.color='#27ae60'}b.textContent='✓'}else{s.innerHTML=`<span style="color:#e74c3c">❌ ${d.error}</span>`;b.disabled=false;b.textContent='🔄'}}catch(e){s.innerHTML=`<span style="color:#e74c3c">❌ ${e.message}</span>`;b.disabled=false;b.textContent='🔄'}}async function del1(id){if(!confirm('確定刪除？'))return;const b=document.getElementById(`del-${id}`);b.disabled=true;try{const r=await fetch('/api/delete-product',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:id})});const d=await r.json();if(d.success)document.getElementById(`product-${id}`).remove();else{alert('失敗');b.disabled=false}}catch(e){alert(e.message);b.disabled=false}}async function retranslateAll(){if(!confirm(`翻譯全部 ${jp.length} 個？`))return;const b=document.getElementById('retranslateAllBtn');b.disabled=true;b.textContent='翻譯中...';let s=0,f=0;for(let i=0;i<jp.length;i++){document.getElementById('progressText').textContent=`${i+1}/${jp.length}`;try{const r=await fetch('/api/retranslate-product',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:jp[i].id})});const d=await r.json();const st=document.getElementById(`status-${jp[i].id}`);if(d.success){s++;if(st)st.innerHTML=`<span style="color:#27ae60">✅ ${d.new_title}</span>`;const t=document.querySelector(`#product-${jp[i].id} .title`);if(t){t.textContent=d.new_title;t.style.color='#27ae60'}}else{f++;if(st)st.innerHTML=`<span style="color:#e74c3c">❌ ${d.error}</span>`;if(f>=3){alert('連續失敗');break}}}catch(e){f++}await new Promise(r=>setTimeout(r,1500))}alert(`成功:${s} 失敗:${f}`);b.textContent='🔄 全部翻譯';b.disabled=false;document.getElementById('progressText').textContent=''}async function deleteAllJP(){if(!confirm(`刪除全部 ${jp.length} 個？`))return;const b=document.getElementById('deleteAllBtn');b.disabled=true;let s=0,f=0;for(let i=0;i<jp.length;i++){document.getElementById('progressText').textContent=`${i+1}/${jp.length}`;try{const r=await fetch('/api/delete-product',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:jp[i].id})});const d=await r.json();if(d.success){s++;const el=document.getElementById(`product-${jp[i].id}`);if(el)el.remove()}else f++}catch(e){f++}await new Promise(r=>setTimeout(r,300))}alert(`成功:${s} 失敗:${f}`);b.textContent='🗑️ 全部刪除';b.disabled=false;document.getElementById('progressText').textContent=''}</script></body></html>'''
 
+
+# === API 路由 ===
 
 @app.route('/api/scan-japanese')
 def api_scan_japanese():
@@ -627,6 +780,21 @@ def api_delete_product():
     return jsonify({'success': delete_product(pid), 'product_id': pid})
 
 
+# === v2.3: 手動觸發同步刪除 ===
+@app.route('/api/sync-delete', methods=['POST'])
+def api_sync_delete():
+    if scrape_status.get('running'):
+        return jsonify({'error': '爬取正在進行中，請稍後再試'}), 400
+    result = sync_delete_stale_products()
+    return jsonify(result)
+
+
+# === v2.3: 查看最近同步紀錄 ===
+@app.route('/api/sync-log')
+def api_sync_log():
+    return jsonify(last_sync_log)
+
+
 @app.route('/api/test-translate')
 def api_test_translate():
     api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -665,15 +833,19 @@ def test_shopify():
 @app.route('/api/test-scrape')
 def test_scrape():
     products = scrape_shopify_products()
-    if products: return jsonify({'success': True, 'source': 'shopify_api', 'count': len(products)})
-    products = scrape_product_list_selenium()
-    return jsonify({'success': True, 'source': 'selenium', 'count': len(products)})
+    return jsonify({'success': True, 'source': 'shopify_api', 'count': len(products),
+                    'skus': [p['sku'] for p in products[:10]]})
 
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("虎屋羊羹爬蟲工具 v2.2")
-    print("新增: 缺貨商品自動刪除")
+    print("虎屋羊羹爬蟲工具 v2.3")
+    print("修復: 分頁 / 安全檢查 / 自動排程")
     print("=" * 50)
+
+    # === v2.3: 啟動自動同步排程 ===
+    if AUTO_SYNC_ENABLED:
+        start_auto_sync_scheduler()
+
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)

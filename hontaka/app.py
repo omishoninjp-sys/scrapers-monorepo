@@ -1,7 +1,14 @@
 """
-本高砂屋商品爬蟲 + Shopify 上架工具 v2.2
+本高砂屋商品爬蟲 + Shopify 上架工具 v2.3
 v2.1: 翻譯保護機制、日文商品掃描、測試翻譯
 v2.2: 缺貨商品自動刪除 - 官網消失或缺貨皆直接刪除
+v2.3: 修復同步 Bug
+  - 修復: existing_skus 改用全店 SKU 比對（不依賴 collection，解決每次重新上架問題）
+  - 新增: get_hontaka_products_map() 用 vendor 篩選虎屋商品
+  - 新增: /api/sync-delete 手動觸發僅刪除（背景執行）
+  - 新增: /api/sync-status 輪詢同步進度
+  - 新增: 每日自動同步排程（預設 JST 10:00）
+  - 新增: 安全閾值防爬蟲異常誤刪
 """
 
 from flask import Flask, jsonify, request
@@ -27,6 +34,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MIN_PRICE = 1000
 MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3
 
+# === v2.3: 安全閾值 ===
+MIN_SCRAPED_PRODUCTS_FOR_DELETE = 5
+
+# === v2.3: 自動同步排程 ===
+AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "true").lower() == "true"
+AUTO_SYNC_HOUR = int(os.environ.get("AUTO_SYNC_HOUR", "10"))  # JST 10:00
+
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -40,6 +54,10 @@ scrape_status = {
     "skipped_exists": 0, "filtered_by_price": 0, "out_of_stock": 0, "deleted": 0,
     "translation_failed": 0, "translation_stopped": False
 }
+
+# === v2.3: 同步狀態 ===
+sync_status = {"running": False, "current_step": "", "finished": False}
+last_sync_log = {"last_run": None, "website_skus_count": 0, "shopify_skus_count": 0, "deleted_skus": [], "errors": []}
 
 
 def is_japanese_text(text):
@@ -183,6 +201,26 @@ def get_collection_products_map(collection_id):
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
+    return pm
+
+
+# === v2.3: 用 vendor 篩選取得所有本高砂屋商品 ===
+def get_hontaka_products_map():
+    """取得 Shopify 上所有本高砂屋商品 {sku: product_id}，不依賴 collection"""
+    pm = {}
+    url = shopify_api_url("products.json?limit=250&vendor=本高砂屋")
+    while url:
+        r = requests.get(url, headers=get_shopify_headers())
+        if r.status_code != 200: break
+        for p in r.json().get('products', []):
+            pid = p.get('id')
+            for v in p.get('variants', []):
+                sk = v.get('sku')
+                if sk and pid: pm[sk] = pid
+        lh = r.headers.get('Link', '')
+        m = re.search(r'<([^>]+)>; rel="next"', lh)
+        url = m.group(1) if m and 'rel="next"' in lh else None
+    print(f"[v2.3] Shopify 本高砂屋商品: {len(pm)} 筆")
     return pm
 
 
@@ -380,6 +418,89 @@ def upload_to_shopify(product, collection_id=None):
     return {'success': False, 'error': r.text}
 
 
+# === v2.3: 獨立的同步刪除函式（背景執行）===
+def sync_delete_stale_products():
+    """比對官網商品清單，刪除已下架商品（僅 SKU 比對，不爬詳情頁）"""
+    global last_sync_log, sync_status
+    sync_status.update({"running": True, "current_step": "開始同步...", "finished": False})
+    log = {"last_run": time.strftime("%Y-%m-%d %H:%M:%S"), "website_skus_count": 0,
+           "shopify_skus_count": 0, "deleted_skus": [], "errors": []}
+    try:
+        if not load_shopify_token():
+            log["errors"].append("Shopify Token 未設定"); last_sync_log = log; return log
+
+        sync_status['current_step'] = "爬取官網商品列表..."
+        product_list = scrape_product_list()
+        website_skus = set(item['sku'] for item in product_list)
+        log["website_skus_count"] = len(website_skus)
+        print(f"[v2.3 sync] 官網商品: {len(website_skus)} 筆")
+
+        if len(website_skus) < MIN_SCRAPED_PRODUCTS_FOR_DELETE:
+            msg = f"官網只爬到 {len(website_skus)} 筆（低於安全閾值 {MIN_SCRAPED_PRODUCTS_FOR_DELETE}），跳過刪除"
+            log["errors"].append(msg); last_sync_log = log; return log
+
+        sync_status['current_step'] = "取得 Shopify 本高砂屋商品..."
+        hontaka_pm = get_hontaka_products_map()
+        log["shopify_skus_count"] = len(hontaka_pm)
+        print(f"[v2.3 sync] Shopify 本高砂屋商品: {len(hontaka_pm)} 筆")
+
+        # SKU 格式橋接：Shopify 可能存短碼 product_code，官網用 12 位數
+        website_skus_normalized = set()
+        for ws in website_skus:
+            website_skus_normalized.add(ws)
+            website_skus_normalized.add(ws.lstrip('0') or '0')
+
+        skus_to_delete = set()
+        for sku in hontaka_pm:
+            if sku not in website_skus_normalized:
+                skus_to_delete.add(sku)
+
+        print(f"[v2.3 sync] 準備刪除 {len(skus_to_delete)} 筆: {skus_to_delete}")
+        sync_status['current_step'] = f"刪除 {len(skus_to_delete)} 筆下架商品..."
+
+        for i, sku in enumerate(skus_to_delete):
+            sync_status['current_step'] = f"刪除 ({i+1}/{len(skus_to_delete)}): {sku}"
+            pid = hontaka_pm.get(sku)
+            if pid:
+                if delete_product(pid):
+                    log["deleted_skus"].append(sku)
+                    print(f"[v2.3 sync] ✓ 已刪除 {sku} (ID: {pid})")
+                else:
+                    log["errors"].append(f"刪除失敗: {sku}")
+            time.sleep(0.3)
+
+        print(f"[v2.3 sync] 完成，共刪除 {len(log['deleted_skus'])} 筆")
+        sync_status['current_step'] = f"完成，刪除 {len(log['deleted_skus'])} 筆"
+    except Exception as e:
+        log["errors"].append(str(e))
+        sync_status['current_step'] = f"錯誤: {e}"
+    finally:
+        sync_status['running'] = False; sync_status['finished'] = True
+    last_sync_log = log
+    return log
+
+
+# === v2.3: 自動同步排程 ===
+def start_auto_sync_scheduler():
+    def scheduler_loop():
+        import datetime as dt
+        while True:
+            try:
+                now_jst = dt.datetime.utcnow() + dt.timedelta(hours=9)
+                target_jst = now_jst.replace(hour=AUTO_SYNC_HOUR, minute=0, second=0, microsecond=0)
+                if now_jst >= target_jst: target_jst += dt.timedelta(days=1)
+                wait = (target_jst - now_jst).total_seconds()
+                print(f"[v2.3 scheduler] 下次自動同步: {target_jst.strftime('%Y-%m-%d %H:%M')} JST（{int(wait)}秒後）")
+                time.sleep(wait)
+                print(f"[v2.3 scheduler] 開始自動同步刪除...")
+                result = sync_delete_stale_products()
+                print(f"[v2.3 scheduler] 完成: 刪除 {len(result.get('deleted_skus', []))} 筆")
+            except Exception as e:
+                print(f"[v2.3 scheduler] 錯誤: {e}"); time.sleep(3600)
+    t = threading.Thread(target=scheduler_loop, daemon=True); t.start()
+    print(f"[v2.3] 自動同步排程已啟動（每日 JST {AUTO_SYNC_HOUR}:00）")
+
+
 def run_scrape():
     global scrape_status
     try:
@@ -391,9 +512,14 @@ def run_scrape():
         scrape_status['current_product'] = "設定 Collection..."
         collection_id = get_or_create_collection("本高砂屋")
 
-        scrape_status['current_product'] = "取得 Collection 商品..."
-        cpm = get_collection_products_map(collection_id)
-        existing_skus = set(cpm.keys())
+        # === v2.3: 用全店 SKU 比對（不依賴 collection），解決重複上架 ===
+        scrape_status['current_product'] = "取得 Shopify 現有商品..."
+        existing_map = get_existing_products_map()
+        existing_skus = set(existing_map.keys())
+
+        scrape_status['current_product'] = "取得本高砂屋商品（用於刪除比對）..."
+        hontaka_pm = get_hontaka_products_map()
+        hontaka_skus = set(hontaka_pm.keys())
 
         scrape_status['current_product'] = "爬取商品列表..."
         product_list = scrape_product_list()
@@ -442,23 +568,40 @@ def run_scrape():
         if not scrape_status['translation_stopped']:
             scrape_status['current_product'] = "清理缺貨/下架商品..."
 
-            # === v2.2: 合併需要刪除的 SKU ===
-            # 1. 官網已消失的 SKU（collection 有但官網沒有）
-            # 2. 官網還在但缺貨的 SKU
-            skus_to_delete = (existing_skus - website_skus) | (existing_skus & out_of_stock_skus)
+            # === v2.3: 安全檢查 + 用 hontaka_pm 比對 ===
+            if len(website_skus) >= MIN_SCRAPED_PRODUCTS_FOR_DELETE:
+                # SKU 格式橋接：Shopify 可能存 product_code（短碼），官網用 12 位數
+                # 建立反查表：短碼 → 有對應的官網 SKU
+                website_skus_padded = set()
+                for ws in website_skus:
+                    website_skus_padded.add(ws)
+                    website_skus_padded.add(ws.lstrip('0') or '0')  # 去前導零版本
 
-            if skus_to_delete:
-                print(f"[v2.2] 準備刪除 {len(skus_to_delete)} 個商品")
-                for sku in skus_to_delete:
-                    scrape_status['current_product'] = f"刪除: {sku}"
-                    pid = cpm.get(sku)
-                    if pid:
-                        if delete_product(pid):
-                            scrape_status['deleted'] += 1
-                            print(f"[已刪除] SKU: {sku}, Product ID: {pid}")
-                        else:
-                            scrape_status['errors'].append({'sku': sku, 'error': '刪除失敗'})
-                    time.sleep(0.3)
+                skus_to_delete = set()
+                for sku in hontaka_skus:
+                    # 檢查 SKU 是否存在於官網（精確 or 去前導零比對）
+                    if sku not in website_skus_padded:
+                        skus_to_delete.add(sku)
+                # 加上缺貨的
+                for sku in hontaka_skus & out_of_stock_skus:
+                    skus_to_delete.add(sku)
+
+                if skus_to_delete:
+                    print(f"[v2.3] 準備刪除 {len(skus_to_delete)} 個商品")
+                    for sku in skus_to_delete:
+                        scrape_status['current_product'] = f"刪除: {sku}"
+                        pid = hontaka_pm.get(sku)
+                        if pid:
+                            if delete_product(pid):
+                                scrape_status['deleted'] += 1
+                                print(f"[已刪除] SKU: {sku}, Product ID: {pid}")
+                            else:
+                                scrape_status['errors'].append({'sku': sku, 'error': '刪除失敗'})
+                        time.sleep(0.3)
+            else:
+                msg = f"⚠️ 官網只爬到 {len(website_skus)} 筆（安全閾值 {MIN_SCRAPED_PRODUCTS_FOR_DELETE}），跳過刪除"
+                scrape_status['errors'].append({'error': msg})
+                print(f"[v2.3] {msg}")
 
         scrape_status['current_product'] = "完成" if not scrape_status['translation_stopped'] else "翻譯異常停止"
     except Exception as e:
@@ -480,12 +623,16 @@ def index():
 <style>*{box-sizing:border-box}body{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f5}h1{color:#333;border-bottom:2px solid #8B4513;padding-bottom:10px}.card{background:white;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}.btn{background:#8B4513;color:white;border:none;padding:12px 24px;border-radius:5px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px;text-decoration:none;display:inline-block}.btn:hover{background:#A0522D}.btn:disabled{background:#ccc}.btn-secondary{background:#3498db}.btn-success{background:#27ae60}.progress-bar{width:100%;height:20px;background:#eee;border-radius:10px;overflow:hidden;margin:10px 0}.progress-fill{height:100%;background:linear-gradient(90deg,#8B4513,#D2691E);transition:width 0.3s}.status{padding:10px;background:#f8f9fa;border-radius:5px;margin-top:10px}.log{max-height:300px;overflow-y:auto;font-family:monospace;font-size:13px;background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:5px}.stats{display:flex;gap:15px;margin-top:15px;flex-wrap:wrap}.stat{flex:1;min-width:70px;text-align:center;padding:15px;background:#f8f9fa;border-radius:5px}.stat-number{font-size:24px;font-weight:bold;color:#8B4513}.stat-label{font-size:10px;color:#666;margin-top:5px}.nav{margin-bottom:20px}.nav a{margin-right:15px;color:#8B4513;text-decoration:none;font-weight:bold}.alert{padding:12px 16px;border-radius:5px;margin-bottom:15px}.alert-danger{background:#fee;border:1px solid #fcc;color:#c0392b}</style></head>
 <body>
 <div class="nav"><a href="/">🏠 首頁</a><a href="/japanese-scan">🇯🇵 日文掃描</a></div>
-<h1>🍪 本高砂屋 爬蟲工具 <small style="font-size:14px;color:#999">v2.2</small></h1>
+<h1>🍪 本高砂屋 爬蟲工具 <small style="font-size:14px;color:#999">v2.3</small></h1>
 <div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:__TC__;">__TS__</span></p>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
 <a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a></div>
-<div class="card"><h3>開始爬取</h3>
+<div class="card"><h3>🔄 同步清理（僅刪除下架商品）</h3>
+<p style="color:#666;font-size:14px">※ 比對官網，刪除已下架商品。不會上架新品。</p>
+<button class="btn" style="background:#e67e22" id="syncBtn" onclick="syncDelete()">🧹 立即同步清理</button>
+<div id="syncResult" style="display:none;margin-top:15px"></div></div>
+<div class="card"><h3>🚀 完整爬取（含上架新品）</h3>
 <p>爬取 hontaka-shop.com 所有商品並上架到 Shopify</p>
 <p style="color:#666;font-size:14px">※ &lt;¥__MIN_COST__ 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止 | <b style="color:#e67e22">缺貨自動刪除</b></p>
 <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
@@ -503,7 +650,7 @@ def index():
 <div class="stat"><div class="stat-number" id="errorCount" style="color:#e74c3c">0</div><div class="stat-label">錯誤</div></div>
 </div></div></div>
 <div class="card"><h3>執行日誌</h3><div class="log" id="logArea">等待開始...</div></div>
-<script>let pollInterval=null;function log(m,t){const l=document.getElementById('logArea');const tm=new Date().toLocaleTimeString();const c={success:'#4ec9b0',error:'#f14c4c'}[t]||'#d4d4d4';l.innerHTML+='<div style="color:'+c+'">['+tm+'] '+m+'</div>';l.scrollTop=l.scrollHeight}function clearLog(){document.getElementById('logArea').innerHTML=''}async function testShopify(){log('測試連線...');try{const r=await fetch('/api/test-shopify');const d=await r.json();if(d.success)log('✓ '+d.shop.name,'success');else log('✗ '+d.error,'error')}catch(e){log('✗ '+e.message,'error')}}async function testTranslate(){log('測試翻譯...');try{const r=await fetch('/api/test-translate');const d=await r.json();if(d.error)log('✗ '+d.error,'error');else if(d.success)log('✓ '+d.title,'success');else log('✗ 翻譯失敗','error')}catch(e){log('✗ '+e.message,'error')}}async function startScrape(){clearLog();log('開始爬取...');document.getElementById('startBtn').disabled=true;document.getElementById('progressSection').style.display='block';document.getElementById('translationAlert').style.display='none';try{const r=await fetch('/api/start',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');document.getElementById('startBtn').disabled=false;return}log('✓ 已啟動','success');pollInterval=setInterval(pollStatus,1000)}catch(e){log('✗ '+e.message,'error');document.getElementById('startBtn').disabled=false}}async function pollStatus(){try{const r=await fetch('/api/status');const d=await r.json();const p=d.total>0?(d.progress/d.total*100):0;document.getElementById('progressFill').style.width=p+'%';document.getElementById('statusText').textContent=d.current_product+' ('+d.progress+'/'+d.total+')';document.getElementById('uploadedCount').textContent=d.uploaded;document.getElementById('skippedCount').textContent=d.skipped_exists||d.skipped||0;document.getElementById('translationFailedCount').textContent=d.translation_failed||0;document.getElementById('filteredCount').textContent=d.filtered_by_price||0;document.getElementById('outOfStockCount').textContent=d.out_of_stock||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors.length;if(d.translation_stopped)document.getElementById('translationAlert').style.display='block';if(!d.running&&d.progress>0){clearInterval(pollInterval);document.getElementById('startBtn').disabled=false;if(d.translation_stopped)log('⚠️ 翻譯異常停止','error');else log('========== 完成 ==========','success')}}catch(e){console.error(e)}}</script></body></html>"""
+<script>let pollInterval=null;function log(m,t){const l=document.getElementById('logArea');const tm=new Date().toLocaleTimeString();const c={success:'#4ec9b0',error:'#f14c4c',warning:'#e67e22'}[t]||'#d4d4d4';l.innerHTML+='<div style="color:'+c+'">['+tm+'] '+m+'</div>';l.scrollTop=l.scrollHeight}function clearLog(){document.getElementById('logArea').innerHTML=''}async function testShopify(){log('測試連線...');try{const r=await fetch('/api/test-shopify');const d=await r.json();if(d.success)log('✓ '+d.shop.name,'success');else log('✗ '+d.error,'error')}catch(e){log('✗ '+e.message,'error')}}async function testTranslate(){log('測試翻譯...');try{const r=await fetch('/api/test-translate');const d=await r.json();if(d.error)log('✗ '+d.error,'error');else if(d.success)log('✓ '+d.title,'success');else log('✗ 翻譯失敗','error')}catch(e){log('✗ '+e.message,'error')}}async function syncDelete(){const b=document.getElementById('syncBtn');const rd=document.getElementById('syncResult');b.disabled=true;b.textContent='同步中...';rd.style.display='none';log('開始同步清理...','warning');try{const r=await fetch('/api/sync-delete',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');b.disabled=false;b.textContent='🧹 立即同步清理';return}log('✓ 同步已啟動','success');const poll=setInterval(async()=>{try{const sr=await fetch('/api/sync-status');const sd=await sr.json();rd.innerHTML='<div style="padding:10px;background:#e8f4fd;border-radius:5px">⏳ '+sd.current_step+'</div>';rd.style.display='block';if(!sd.running&&sd.finished){clearInterval(poll);const del_count=sd.deleted_skus?sd.deleted_skus.length:0;const msg=`✓ 同步完成：官網 ${sd.website_skus_count} 筆 / Shopify ${sd.shopify_skus_count} 筆 / 刪除 ${del_count} 筆`;log(msg,'success');if(sd.deleted_skus&&sd.deleted_skus.length>0)sd.deleted_skus.forEach(s=>log('  刪除: '+s,'warning'));rd.innerHTML='<div style="padding:10px;background:#e8f4fd;border-radius:5px">'+msg+'</div>';b.disabled=false;b.textContent='🧹 立即同步清理'}}catch(e){console.error(e)}},2000)}catch(e){log('✗ '+e.message,'error');b.disabled=false;b.textContent='🧹 立即同步清理'}}async function startScrape(){clearLog();log('開始爬取...');document.getElementById('startBtn').disabled=true;document.getElementById('progressSection').style.display='block';document.getElementById('translationAlert').style.display='none';try{const r=await fetch('/api/start',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');document.getElementById('startBtn').disabled=false;return}log('✓ 已啟動','success');pollInterval=setInterval(pollStatus,1000)}catch(e){log('✗ '+e.message,'error');document.getElementById('startBtn').disabled=false}}async function pollStatus(){try{const r=await fetch('/api/status');const d=await r.json();const p=d.total>0?(d.progress/d.total*100):0;document.getElementById('progressFill').style.width=p+'%';document.getElementById('statusText').textContent=d.current_product+' ('+d.progress+'/'+d.total+')';document.getElementById('uploadedCount').textContent=d.uploaded;document.getElementById('skippedCount').textContent=d.skipped_exists||d.skipped||0;document.getElementById('translationFailedCount').textContent=d.translation_failed||0;document.getElementById('filteredCount').textContent=d.filtered_by_price||0;document.getElementById('outOfStockCount').textContent=d.out_of_stock||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors.length;if(d.translation_stopped)document.getElementById('translationAlert').style.display='block';if(!d.running&&d.progress>0){clearInterval(pollInterval);document.getElementById('startBtn').disabled=false;if(d.translation_stopped)log('⚠️ 翻譯異常停止','error');else log('========== 完成 ==========','success')}}catch(e){console.error(e)}}</script></body></html>"""
     return html.replace('__TC__', tc).replace('__TS__', ts).replace('__MIN_COST__', str(MIN_PRICE)).replace('__MAX_FAIL__', str(MAX_CONSECUTIVE_TRANSLATION_FAILURES))
 
 
@@ -586,6 +733,25 @@ def api_delete_product():
     return jsonify({'success': delete_product(pid), 'product_id': pid})
 
 
+# === v2.3: 同步刪除 API ===
+@app.route('/api/sync-delete', methods=['POST'])
+def api_sync_delete():
+    if scrape_status.get('running'): return jsonify({'error': '完整爬取正在進行中'}), 400
+    if sync_status.get('running'): return jsonify({'error': '同步已在進行中'}), 400
+    threading.Thread(target=sync_delete_stale_products, daemon=True).start()
+    return jsonify({'message': '同步清理已啟動'})
+
+
+@app.route('/api/sync-status')
+def api_sync_status():
+    return jsonify({**sync_status, **last_sync_log})
+
+
+@app.route('/api/sync-log')
+def api_sync_log():
+    return jsonify(last_sync_log)
+
+
 @app.route('/api/test-translate')
 def api_test_translate():
     api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -626,8 +792,12 @@ def test_shopify():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("本高砂屋 爬蟲工具 v2.2")
-    print("新增: 缺貨商品自動刪除")
+    print("本高砂屋 爬蟲工具 v2.3")
+    print("修復: 重複上架 / 安全檢查 / 自動排程")
     print("=" * 50)
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+# === v2.3: 在模組載入時啟動排程（gunicorn 也會觸發）===
+if AUTO_SYNC_ENABLED:
+    start_auto_sync_scheduler()

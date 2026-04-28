@@ -509,6 +509,64 @@ def upload_to_shopify(product, collection_id=None):
 
 # ========== Flask 路由 ==========
 
+
+# ========== 運費 HTML 批次更新 ==========
+
+update_shipping_status = {"running": False, "done": 0, "total": 0, "skipped": 0, "errors": []}
+
+
+def run_update_shipping():
+    global update_shipping_status
+    update_shipping_status = {"running": True, "done": 0, "total": 0, "skipped": 0, "errors": []}
+    try:
+        collection_id = get_or_create_collection("Francais")
+        cpm = get_collection_products_map(collection_id)
+        pids = list(set(cpm.values()))
+        update_shipping_status["total"] = len(pids)
+        for pid in pids:
+            try:
+                r = requests.get(shopify_api_url(f"products/{pid}.json"), headers=get_shopify_headers())
+                if r.status_code != 200:
+                    update_shipping_status["errors"].append(f"取得失敗 {pid}")
+                    continue
+                product = r.json().get("product", {})
+                body = product.get("body_html", "") or ""
+                if "國際運費" in body:
+                    update_shipping_status["skipped"] += 1
+                    continue
+                ru = requests.put(
+                    shopify_api_url(f"products/{pid}.json"),
+                    headers=get_shopify_headers(),
+                    json={"product": {"id": pid, "body_html": body + SHIPPING_HTML}}
+                )
+                if ru.status_code == 200:
+                    update_shipping_status["done"] += 1
+                else:
+                    update_shipping_status["errors"].append(f"更新失敗 {pid}: {ru.status_code}")
+            except Exception as e:
+                update_shipping_status["errors"].append(str(e))
+    except Exception as e:
+        update_shipping_status["errors"].append(str(e))
+    finally:
+        update_shipping_status["running"] = False
+
+
+@app.route("/api/update-shipping", methods=["POST"])
+def api_update_shipping():
+    if not load_shopify_token():
+        return jsonify({"error": "未設定 Token"}), 400
+    if update_shipping_status.get("running"):
+        return jsonify({"error": "更新已在進行中"}), 400
+    import threading
+    threading.Thread(target=run_update_shipping, daemon=True).start()
+    return jsonify({"message": "開始更新運費說明，請輪詢 /api/update-shipping-status"})
+
+
+@app.route("/api/update-shipping-status")
+def api_update_shipping_status():
+    return jsonify(update_shipping_status)
+
+
 @app.route('/')
 def index():
     token_loaded = load_shopify_token()

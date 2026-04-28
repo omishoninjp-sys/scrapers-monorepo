@@ -35,6 +35,7 @@ LIST_PAGE_URL_TEMPLATE = "https://sucreyshopping.jp/shop/c/c10_p{page}/?brand=fr
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MIN_PRICE = 1000
 MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3
+SHIPPING_HTML = '<div style="margin-top:24px;border-top:1px solid #e8eaf0;padding-top:20px;"><h2 style="font-size:16px;font-weight:700;color:#1a1a2e;border-bottom:2px solid #e8eaf0;padding-bottom:8px;margin:0 0 16px;">國際運費（空運・包稅）</h2><p style="margin:0 0 6px;font-size:13px;color:#444;">✓ 含關稅\u3000✓ 含台灣配送費\u3000✓ 只收實重\u3000✓ 無材積費</p><p style="margin:0 0 12px;font-size:13px;color:#444;">起運 1 kg，未滿 1 kg 以 1 kg 計算，每增加 0.5 kg 加收 ¥500。</p><table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:10px;"><tbody><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">≦ 1.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,000 <span style="color:#888;font-weight:400;">≈ NT$200</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.1 ～ 1.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,500 <span style="color:#888;font-weight:400;">≈ NT$300</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.6 ～ 2.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,000 <span style="color:#888;font-weight:400;">≈ NT$400</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.1 ～ 2.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,500 <span style="color:#888;font-weight:400;">≈ NT$500</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.6 ～ 3.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥3,000 <span style="color:#888;font-weight:400;">≈ NT$600</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">每增加 0.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">+¥500\u3000<span style="color:#888;">+≈ NT$100</span></td></tr></tbody></table><p style="margin:0 0 28px;font-size:12px;color:#999;">NT$ 匯率僅供參考，實際以下單當日匯率為準。運費於商品到倉後出貨前確認重量後統一請款。</p></div>'
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -141,29 +142,21 @@ def clean_html_for_translation(html_text):
 
 def translate_with_chatgpt(title, description, retry=False):
     clean_description = clean_html_for_translation(description)
-    prompt = f"""你是專業的日本商品翻譯和 SEO 專家。請將以下日本甜點商品資訊翻譯成繁體中文，並優化 SEO。
+    prompt = f"""你是專業的日本商品翻譯和 SEO 專家。將以下日本商品資訊翻譯成繁體中文並優化 SEO。
 
-商品名稱（日文）：{title}
-商品說明（日文）：{clean_description[:1500]}
+商品名稱：{title}
+商品說明：{clean_description[:1500]}
 
-請回傳 JSON 格式（不要加 markdown 標記）：
-{{
-    "title": "翻譯後的商品名稱（繁體中文，簡潔有力，前面加上 Francais）",
-    "description": "翻譯後的商品說明（繁體中文，保留原意但更流暢，適合電商展示）",
-    "page_title": "SEO 頁面標題（繁體中文，包含 Francais 品牌和商品特色，50-60字以內）",
-    "meta_description": "SEO 描述（繁體中文，吸引點擊，包含關鍵字，100字以內）"
-}}
+只回傳此 JSON 格式，不加 markdown、不加任何其他文字：
+{"title":"翻譯後的商品名稱","description":"翻譯後的商品說明（HTML格式）","page_title":"SEO標題50字以內","meta_description":"SEO描述100字以內"}
 
-重要規則：
-1. 這是日本 Francais 的高級洋菓子（千層派、檸檬蛋糕等）
-2. 翻譯要自然流暢，不要生硬
-3. 商品標題開頭必須是「Francais」（英文）
-4. 【禁止使用任何日文】所有內容必須是繁體中文或英文，不可出現任何日文字
-5. SEO 內容要包含：Francais、日本、千層派、伴手禮、送禮等關鍵字
-6. 日文詞彙翻譯對照：ミルフィユ→千層派、洋菓子→西式甜點、詰合せ→綜合禮盒
-7. 只回傳 JSON，不要其他文字"
-    if retry:
-        prompt += "\n\n【嚴重警告】上次翻譯結果仍然包含日文字元（平假名/片假名）！這次你必須：\n1. 將所有日文平假名、片假名完全翻譯成繁體中文\n2. ミルフィユ→千層派、洋菓子→西式甜點、詰合せ→綜合禮盒、果実→水果、贅沢→奢華\n3. 絕對不可以出現任何 ひらがな 或 カタカナ\n4. 商品名中的日文必須全部意譯成中文"""
+規則：
+1. 品牌背景：日本高級洋菓子品牌，主打千層派與精緻西式甜點
+2. 標題開頭必須是「Francais」，後接繁體中文商品名，不得省略
+3. 【強制禁止日文】所有輸出必須是繁體中文或英文，不可出現任何平假名或片假名
+4. 詞彙對照：ミルフィユ→千層派；洋菓子→西式甜點；詰合せ→綜合禮盒；果実→水果；贅沢→奢華
+5. SEO 關鍵字必須自然融入，包含：Francais、日本、千層派、西式甜點、伴手禮、送禮
+6. 只回傳 JSON，不得有任何其他文字"""
 
     try:
         response = requests.post(
@@ -487,7 +480,7 @@ def upload_to_shopify(product, collection_id=None):
 
     shopify_product = {
         'product': {
-            'title': translated['title'], 'body_html': translated['description'],
+            'title': translated['title'], 'body_html': translated['description'] + SHIPPING_HTML,
             'vendor': 'Francais', 'product_type': '千層派・西式甜點',
             'status': 'active', 'published': True,
             'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
@@ -836,7 +829,7 @@ def api_retranslate_product():
         else:
             return jsonify({'success': False, 'error': '翻譯後仍含日文，請手動修改'})
     success, resp = update_product(product_id, {
-        'title': translated['title'], 'body_html': translated['description'],
+        'title': translated['title'], 'body_html': translated['description'] + SHIPPING_HTML,
         'metafields_global_title_tag': translated['page_title'],
         'metafields_global_description_tag': translated['meta_description']
     })

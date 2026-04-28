@@ -33,6 +33,7 @@ LIST_PAGE_URL_TEMPLATE = "https://www.hontaka-shop.com/shopbrand/all_items/page{
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MIN_PRICE = 1000
 MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3
+SHIPPING_HTML = '<div style="margin-top:24px;border-top:1px solid #e8eaf0;padding-top:20px;"><h2 style="font-size:16px;font-weight:700;color:#1a1a2e;border-bottom:2px solid #e8eaf0;padding-bottom:8px;margin:0 0 16px;">國際運費（空運・包稅）</h2><p style="margin:0 0 6px;font-size:13px;color:#444;">✓ 含關稅\u3000✓ 含台灣配送費\u3000✓ 只收實重\u3000✓ 無材積費</p><p style="margin:0 0 12px;font-size:13px;color:#444;">起運 1 kg，未滿 1 kg 以 1 kg 計算，每增加 0.5 kg 加收 ¥500。</p><table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:10px;"><tbody><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">≦ 1.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,000 <span style="color:#888;font-weight:400;">≈ NT$200</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.1 ～ 1.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,500 <span style="color:#888;font-weight:400;">≈ NT$300</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.6 ～ 2.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,000 <span style="color:#888;font-weight:400;">≈ NT$400</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.1 ～ 2.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,500 <span style="color:#888;font-weight:400;">≈ NT$500</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.6 ～ 3.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥3,000 <span style="color:#888;font-weight:400;">≈ NT$600</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">每增加 0.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">+¥500\u3000<span style="color:#888;">+≈ NT$100</span></td></tr></tbody></table><p style="margin:0 0 28px;font-size:12px;color:#999;">NT$ 匯率僅供參考，實際以下單當日匯率為準。運費於商品到倉後出貨前確認重量後統一請款。</p></div>'
 
 # === v2.3: 安全閾值 ===
 MIN_SCRAPED_PRODUCTS_FOR_DELETE = 5
@@ -134,17 +135,21 @@ def clean_html_for_translation(html_text):
 
 def translate_with_chatgpt(title, description, retry=False):
     clean_desc = clean_html_for_translation(description)
-    prompt = f"""你是專業的日本商品翻譯和 SEO 專家。翻譯成繁體中文並優化 SEO。
+    prompt = f"""你是專業的日本商品翻譯和 SEO 專家。將以下日本商品資訊翻譯成繁體中文並優化 SEO。
 
 商品名稱：{title}
 商品說明：{clean_desc[:1500]}
 
-回傳 JSON（不加 markdown）：
-{{"title":"名稱（前加「本高砂屋」）","description":"說明","page_title":"SEO標題50-60字","meta_description":"SEO描述100字內"}}
+只回傳此 JSON 格式，不加 markdown、不加任何其他文字：
+{"title":"翻譯後的商品名稱","description":"翻譯後的商品說明（HTML格式）","page_title":"SEO標題50字以內","meta_description":"SEO描述100字以內"}
 
-規則：1.本高砂屋洋菓子 2.エコルセ→薄餅捲 3.マンデルチーゲル→杏仁瓦片餅 4.開頭「本高砂屋」5.禁日文 6.只回傳JSON"
-    if retry:
-        prompt += "\n\n【嚴重警告】上次翻譯結果仍然包含日文字元！這次你必須：\n1. 將所有日文平假名、片假名完全翻譯成繁體中文\n2. うす皮→薄皮、金鍔→金鍔餅、詰合せ→綜合禮盒、迎春→迎春、翔ける→飛翔\n3. 絕對不可以出現任何 ひらがな 或 カタカナ\n4. 商品名中的日文必須全部意譯成中文"""
+規則：
+1. 品牌背景：日本神戶創業百年的高級西式甜點老舖
+2. 標題開頭必須是「本高砂屋」，後接繁體中文商品名，不得省略
+3. 【強制禁止日文】所有輸出必須是繁體中文或英文，不可出現任何平假名或片假名
+4. 詞彙對照：エコルセ→薄餅捲；マンデルチーゲル→杏仁瓦片餅；うす皮→薄皮；金鍔→金鍔餅；詰合せ→綜合禮盒
+5. SEO 關鍵字必須自然融入，包含：本高砂屋、日本、神戶、伴手禮、西式甜點
+6. 只回傳 JSON，不得有任何其他文字"""
     try:
         r = requests.post("https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
@@ -426,7 +431,7 @@ def upload_to_shopify(product, collection_id=None):
         time.sleep(0.3)
     sku = product.get('product_code') or product['sku']
     sp = {'product': {
-        'title': translated['title'], 'body_html': translated['description'],
+        'title': translated['title'], 'body_html': translated['description'] + SHIPPING_HTML,
         'vendor': '本高砂屋', 'product_type': '西式甜點', 'status': 'active', 'published': True,
         'variants': [{'sku': sku, 'price': f"{selling_price:.2f}",
             'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
@@ -741,7 +746,7 @@ def api_retranslate_product():
         else:
             return jsonify({'success': False, 'error': '翻譯後仍含日文，請手動修改'})
     ok, r = update_product(pid, {
-        'title': translated['title'], 'body_html': translated['description'],
+        'title': translated['title'], 'body_html': translated['description'] + SHIPPING_HTML,
         'metafields_global_title_tag': translated['page_title'],
         'metafields_global_description_tag': translated['meta_description']
     })

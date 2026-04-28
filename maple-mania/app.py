@@ -30,6 +30,7 @@ LIST_PAGES = [
 BRAND_PREFIX = "The maple mania 楓糖男孩"
 MIN_PRICE = 1000
 MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3
+SHIPPING_HTML = '<div style="margin-top:24px;border-top:1px solid #e8eaf0;padding-top:20px;"><h2 style="font-size:16px;font-weight:700;color:#1a1a2e;border-bottom:2px solid #e8eaf0;padding-bottom:8px;margin:0 0 16px;">國際運費（空運・包稅）</h2><p style="margin:0 0 6px;font-size:13px;color:#444;">✓ 含關稅\u3000✓ 含台灣配送費\u3000✓ 只收實重\u3000✓ 無材積費</p><p style="margin:0 0 12px;font-size:13px;color:#444;">起運 1 kg，未滿 1 kg 以 1 kg 計算，每增加 0.5 kg 加收 ¥500。</p><table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:10px;"><tbody><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">≦ 1.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,000 <span style="color:#888;font-weight:400;">≈ NT$200</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.1 ～ 1.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,500 <span style="color:#888;font-weight:400;">≈ NT$300</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.6 ～ 2.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,000 <span style="color:#888;font-weight:400;">≈ NT$400</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.1 ～ 2.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,500 <span style="color:#888;font-weight:400;">≈ NT$500</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.6 ～ 3.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥3,000 <span style="color:#888;font-weight:400;">≈ NT$600</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">每增加 0.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">+¥500\u3000<span style="color:#888;">+≈ NT$100</span></td></tr></tbody></table><p style="margin:0 0 28px;font-size:12px;color:#999;">NT$ 匯率僅供參考，實際以下單當日匯率為準。運費於商品到倉後出貨前確認重量後統一請款。</p></div>'
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 BROWSER_HEADERS = {
@@ -133,17 +134,23 @@ def translate_with_chatgpt(title, description, retry=False):
     clean_desc = re.sub(r'[\d,]+\s*円', '', clean_desc)
     clean_desc = re.sub(r'價格[：:]\s*[\d,]+\s*日圓', '', clean_desc)
     clean_desc = re.sub(r'税込[\d,]+円', '', clean_desc)
-    prompt = f"""你是專業的日本商品翻譯和 SEO 專家。請翻譯成繁體中文並優化 SEO。
+    prompt = f"""你是專業的日本商品翻譯和 SEO 專家。將以下日本商品資訊翻譯成繁體中文並優化 SEO。
 
 商品名稱：{title}
 商品說明：{clean_desc[:1500]}
 
-回傳 JSON（不加 markdown）：
-{{"title":"名稱（前加 The maple mania 楓糖男孩）","description":"說明（HTML，不含價格）","page_title":"SEO標題50-60字","meta_description":"SEO描述100字內"}}
+只回傳此 JSON 格式，不加 markdown、不加任何其他文字：
+{"title":"翻譯後的商品名稱","description":"翻譯後的商品說明（HTML格式）","page_title":"SEO標題50字以內","meta_description":"SEO描述100字以內"}
 
-規則：1.楓糖男孩東京伴手禮 2.開頭「The maple mania 楓糖男孩」3.禁止價格 4.只回傳JSON 5.禁止日文"""
+規則：
+1. 品牌背景：日本東京人氣伴手禮品牌，主打楓糖風味餅乾
+2. 標題開頭必須是「The maple mania 楓糖男孩」，後接繁體中文商品名，不得省略
+3. 【強制禁止日文】所有輸出必須是繁體中文或英文，不可出現任何平假名或片假名
+4. 詞彙對照：メープルバタークッキー→楓糖奶油餅乾；詰合せ→綜合禮盒；說明禁止含任何價格資訊
+5. SEO 關鍵字必須自然融入，包含：The maple mania、楓糖男孩、日本、東京、伴手禮、楓糖餅乾
+6. 只回傳 JSON，不得有任何其他文字"""
     if retry:
-        prompt += "\n\n【嚴重警告】上次翻譯結果仍然包含日文字元！這次你必須：\n1. 將所有日文完全翻譯成繁體中文\n2. 絕對不可以出現任何 ひらがな 或 カタカナ\n3. 商品名中的日文必須全部意譯成中文"
+        prompt += "\n\n【重要警告】前次翻譯輸出仍含有日文字元（平假名或片假名），請這次嚴格執行：\n1. 所有日文必須完整翻譯成繁體中文，不得保留任何假名\n2. 若不確定翻譯，請意譯其含義，絕對不可直接保留日文\n3. 商品名稱中的日文單字全部必須翻譯"
     try:
         response = requests.post("https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
@@ -418,7 +425,7 @@ def upload_to_shopify(product, collection_id=None):
             images_b64.append({'attachment': result['base64'], 'position': idx+1, 'filename': f"maple_mania_{product['sku']}_{idx+1}.jpg"})
         time.sleep(0.5)
     sp = {'product': {
-        'title': translated['title'], 'body_html': translated['description'],
+        'title': translated['title'], 'body_html': translated['description'] + SHIPPING_HTML,
         'vendor': 'The maple mania 楓糖男孩', 'product_type': 'クッキー・洋菓子',
         'status': 'active', 'published': True,
         'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
@@ -653,7 +660,7 @@ def api_retranslate_product():
         retry = translate_with_chatgpt(product.get('title', ''), product.get('body_html', ''), retry=True)
         if retry['success'] and not is_japanese_text(retry['title']): translated = retry
         else: return jsonify({'success': False, 'error': '翻譯後仍含日文'})
-    ok, r = update_product(pid, {'title': translated['title'], 'body_html': translated['description'],
+    ok, r = update_product(pid, {'title': translated['title'], 'body_html': translated['description'] + SHIPPING_HTML,
         'metafields_global_title_tag': translated['page_title'], 'metafields_global_description_tag': translated['meta_description']})
     if ok: return jsonify({'success': True, 'old_title': product.get('title', ''), 'new_title': translated['title'], 'product_id': pid})
     return jsonify({'success': False, 'error': f'更新失敗: {r.text[:200]}'})

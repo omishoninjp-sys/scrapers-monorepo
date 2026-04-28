@@ -616,7 +616,7 @@ def index():
         <p>Token: <span style="color: {token_color};">{token_status}</span></p>
         <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
         <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
-        <a href="/japanese-scan" class="btn btn-success">🇯🇵 掃描日文商品</a>
+        <a href="/japanese-scan" class="btn btn-success">🇯🇵 掃描日文商品</a> <button class='btn' style='background:#2ecc71' onclick='updateShipping()'>📦 更新運費說明</button>
     </div>
     <div class="card">
         <h3>開始爬取</h3>

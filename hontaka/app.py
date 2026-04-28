@@ -98,9 +98,22 @@ def shopify_api_url(endpoint):
     return f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/{endpoint}"
 
 
-def calculate_selling_price(cost, weight):
+def calculate_selling_price(cost):
     if not cost or cost <= 0: return 0
-    return round((cost + (weight * 1250 if weight else 0)) / 0.7)
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def clean_html_for_translation(html_text):
@@ -179,7 +192,12 @@ def get_existing_products_map():
             pid = p.get('id')
             for v in p.get('variants', []):
                 sk = v.get('sku')
-                if sk and pid: pm[sk] = pid
+                if sk and pid:
+                    pm[sk] = {
+                        'product_id': pid,
+                        'variant_id': v.get('id'),
+                        'price': float(v.get('price') or 0),
+                    }
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -197,7 +215,12 @@ def get_collection_products_map(collection_id):
             pid = p.get('id')
             for v in p.get('variants', []):
                 sk = v.get('sku')
-                if sk and pid: pm[sk] = pid
+                if sk and pid:
+                    pm[sk] = {
+                        'product_id': pid,
+                        'variant_id': v.get('id'),
+                        'price': float(v.get('price') or 0),
+                    }
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -216,7 +239,12 @@ def get_hontaka_products_map():
             pid = p.get('id')
             for v in p.get('variants', []):
                 sk = v.get('sku')
-                if sk and pid: pm[sk] = pid
+                if sk and pid:
+                    pm[sk] = {
+                        'product_id': pid,
+                        'variant_id': v.get('id'),
+                        'price': float(v.get('price') or 0),
+                    }
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -387,8 +415,8 @@ def upload_to_shopify(product, collection_id=None):
             translated = retry
         else:
             return {'success': False, 'error': 'translation_failed', 'translated': translated}
-    cost = product['price']; weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    cost = product['price']
+    selling_price = calculate_selling_price(cost)
     images_b64 = []
     for idx, iu in enumerate(product.get('images', [])):
         if not iu or not iu.startswith('http'): continue
@@ -400,8 +428,8 @@ def upload_to_shopify(product, collection_id=None):
     sp = {'product': {
         'title': translated['title'], 'body_html': translated['description'],
         'vendor': '本高砂屋', 'product_type': '西式甜點', 'status': 'active', 'published': True,
-        'variants': [{'sku': sku, 'price': f"{selling_price:.2f}", 'weight': weight,
-            'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+        'variants': [{'sku': sku, 'price': f"{selling_price:.2f}",
+            'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
         'images': images_b64, 'tags': '本高砂屋, 日本, 神戶, 西式甜點, 伴手禮, 日本代購, 送禮, エコルセ, 薄餅',
         'metafields_global_title_tag': translated['page_title'],
         'metafields_global_description_tag': translated['meta_description'],

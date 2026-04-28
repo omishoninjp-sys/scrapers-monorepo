@@ -80,9 +80,22 @@ def shopify_api_url(endpoint):
     return f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/{endpoint}"
 
 
-def calculate_selling_price(cost, weight):
+def calculate_selling_price(cost):
     if not cost or cost <= 0: return 0
-    return round((cost + (weight * 1250 if weight else 0)) / 0.7)
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def translate_with_chatgpt(title, description):
@@ -126,7 +139,12 @@ def get_existing_products_map():
             pid = p.get('id')
             for v in p.get('variants', []):
                 sk = v.get('sku')
-                if sk and pid: pm[sk] = pid
+                if sk and pid:
+                    pm[sk] = {
+                        'product_id': pid,
+                        'variant_id': v.get('id'),
+                        'price': float(v.get('price') or 0),
+                    }
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -144,7 +162,12 @@ def get_collection_products_map(collection_id):
             pid = p.get('id')
             for v in p.get('variants', []):
                 sk = v.get('sku')
-                if sk and pid: pm[sk] = pid
+                if sk and pid:
+                    pm[sk] = {
+                        'product_id': pid,
+                        'variant_id': v.get('id'),
+                        'price': float(v.get('price') or 0),
+                    }
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -302,15 +325,15 @@ def upload_to_shopify(product, collection_id=None):
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
     if not translated['success']:
         return {'success': False, 'error': 'translation_failed', 'translated': translated}
-    cost = product['price']; weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    cost = product['price']
+    selling_price = calculate_selling_price(cost)
     images = [{'src': u, 'position': i+1} for i, u in enumerate(product.get('images', []))]
     sp = {'product': {
         'title': translated['title'], 'body_html': translated['description'],
         'vendor': '小倉山荘', 'product_type': '米菓・詰め合わせ',
         'status': 'active', 'published': True,
-        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}", 'weight': weight,
-            'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
+            'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
         'images': images,
         'tags': '小倉山荘, 日本, 京都, 米菓, あられ, せんべい, 伴手禮, 日本零食',
         'metafields_global_title_tag': translated['page_title'],

@@ -92,9 +92,22 @@ def normalize_sku(sku):
     return sku.strip().lower()
 
 
-def calculate_selling_price(cost, weight):
+def calculate_selling_price(cost):
     if not cost or cost <= 0: return 0
-    return round((cost + (weight * 1250 if weight else 0)) / 0.7)
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def clean_html_for_translation(html_text):
@@ -172,10 +185,6 @@ def download_image_to_base64(img_url, max_retries=3):
     return {'success': False}
 
 
-def get_existing_skus():
-    return set(get_existing_products_map().keys())
-
-
 def get_existing_products_map():
     pm = {}
     url = shopify_api_url("products.json?limit=250")
@@ -187,8 +196,9 @@ def get_existing_products_map():
             for v in p.get('variants', []):
                 sk = v.get('sku')
                 if sk and pid:
-                    n = normalize_sku(sk); pm[n] = pid
-                    if sk != n: pm[sk] = pid
+                    n = normalize_sku(sk)
+                    pm[n] = {'product_id': pid, 'variant_id': v.get('id'), 'price': float(v.get('price') or 0)}
+                    if sk != n: pm[sk] = pm[n]
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -398,8 +408,8 @@ def upload_to_shopify(product, collection_id=None):
             translated = retry
         else:
             return {'success': False, 'error': 'translation_failed', 'translated': translated}
-    cost = product['price']; weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    cost = product['price']
+    selling_price = calculate_selling_price(cost)
     images_b64 = []
     for idx, iu in enumerate(product.get('images', [])):
         if not iu or not iu.startswith('http'): continue
@@ -411,8 +421,8 @@ def upload_to_shopify(product, collection_id=None):
         'title': translated['title'], 'body_html': translated['description'],
         'vendor': 'The maple mania 楓糖男孩', 'product_type': 'クッキー・洋菓子',
         'status': 'active', 'published': True,
-        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}", 'weight': weight,
-            'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
+            'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
         'images': images_b64,
         'tags': 'The maple mania, 楓糖男孩, メープルマニア, 日本, 東京, 伴手禮, 東京土産, 日本代購, 楓糖餅乾',
         'metafields_global_title_tag': translated['page_title'],
@@ -440,7 +450,8 @@ def run_scrape():
             "translation_failed": 0, "translation_stopped": False})
 
         scrape_status['current_product'] = "檢查 Shopify 已有商品..."
-        all_pm = get_existing_products_map(); existing_skus = set(all_pm.keys())
+        all_pm = get_existing_products_map()
+        existing_skus = set(all_pm.keys())
 
         scrape_status['current_product'] = "設定 Collection..."
         collection_id = get_or_create_collection("The maple mania 楓糖男孩")
@@ -463,11 +474,25 @@ def run_scrape():
             scrape_status['current_product'] = f"處理: {item['sku']}"
 
             if item['sku'] in existing_skus:
-                # === v2.2: 已上架商品也檢查庫存 ===
+                # 已上架商品：爬詳情取得現在售價 + 缺貨偵測
                 if item['sku'] in collection_skus:
-                    if not check_product_in_stock(item['sku_raw']):
-                        out_of_stock_skus.add(item['sku'])
-                        print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                    product = scrape_product_detail(item['url'])
+                    if product:
+                        if not product.get('in_stock', True):
+                            out_of_stock_skus.add(item['sku'])
+                            print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                        elif product.get('price', 0) >= MIN_PRICE:
+                            new_selling_price = calculate_selling_price(product['price'])
+                            variant_info = all_pm.get(item['sku'], {})
+                            vid = variant_info.get('variant_id')
+                            if vid and abs(new_selling_price - variant_info.get('price', 0)) >= 1:
+                                requests.put(
+                                    shopify_api_url(f'variants/{vid}.json'),
+                                    headers=get_shopify_headers(),
+                                    json={'variant': {'id': vid,
+                                                      'price': f"{new_selling_price:.2f}",
+                                                      'cost': f"{product['price']:.2f}"}}
+                                )
                     time.sleep(0.5)
                 scrape_status['skipped_exists'] += 1; scrape_status['skipped'] += 1; continue
 

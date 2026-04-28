@@ -102,11 +102,22 @@ def is_japanese_text(text):
     return False
 
 
-def calculate_selling_price(cost, weight):
-    if not cost or cost <= 0:
-        return 0
-    shipping_cost = weight * 1250 if weight else 0
-    return round((cost + shipping_cost) / 0.7)
+def calculate_selling_price(cost):
+    if not cost or cost <= 0: return 0
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def clean_html_for_translation(html_text):
@@ -464,8 +475,7 @@ def upload_to_shopify(product, collection_id=None):
     print(f"[翻譯成功] {translated['title'][:30]}...")
 
     cost = product['price']
-    weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    selling_price = calculate_selling_price(cost)
 
     images_base64 = []
     for idx, img_url in enumerate(product.get('images', [])):
@@ -480,8 +490,8 @@ def upload_to_shopify(product, collection_id=None):
             'title': translated['title'], 'body_html': translated['description'],
             'vendor': 'Francais', 'product_type': '千層派・西式甜點',
             'status': 'active', 'published': True,
-            'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}", 'weight': weight,
-                          'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+            'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
+                          'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
             'images': images_base64,
             'tags': 'Francais, 日本, 西式甜點, 千層派, 伴手禮, 日本代購, 送禮',
             'metafields_global_title_tag': translated['page_title'],

@@ -114,9 +114,22 @@ def is_japanese_text(text):
     return jp > 0 and (jp / total > 0.3 or cn == 0)
 
 
-def calculate_selling_price(cost, weight):
+def calculate_selling_price(cost):
     if not cost or cost <= 0: return 0
-    return round((cost + (weight * 1250 if weight else 0)) / 0.7)
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def translate_with_chatgpt(title, description):
@@ -170,7 +183,7 @@ def get_all_products_detailed():
 
 
 def get_existing_products_full():
-    result = {'by_sku': {}, 'by_title': {}, 'by_handle': {}}
+    result = {'by_sku': {}, 'by_title': {}, 'by_handle': {}, 'by_variant': {}}
     url = shopify_api_url("products.json?limit=250&fields=id,title,handle,variants")
     while url:
         r = requests.get(url, headers=get_shopify_headers())
@@ -186,6 +199,10 @@ def get_existing_products_full():
                     n = normalize_sku(sku)
                     result['by_sku'][n] = pid
                     if sku != n: result['by_sku'][sku] = pid
+                    result['by_variant'][n] = {
+                        'variant_id': v.get('id'),
+                        'price': float(v.get('price') or 0),
+                    }
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -377,15 +394,15 @@ def upload_to_shopify(product, collection_id=None, existing_titles=None):
         if normalize_title(translated['title']) in existing_titles:
             return {'success': False, 'error': 'title_duplicate', 'translated': translated}
 
-    cost = product['price']; weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    cost = product['price']
+    selling_price = calculate_selling_price(cost)
     images = [{'src': u, 'position': i+1} for i, u in enumerate(product.get('images', []))]
 
     sp = {'product': {
         'title': translated['title'], 'body_html': translated['description'],
         'vendor': '神戶風月堂', 'product_type': '法蘭酥', 'status': 'active', 'published': True,
-        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}", 'weight': weight,
-            'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
+            'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
         'images': images, 'tags': '神戶風月堂, 日本, 法蘭酥, ゴーフル, 伴手禮, 日本零食, 神戶',
         'metafields_global_title_tag': translated['page_title'],
         'metafields_global_description_tag': translated['meta_description'],
@@ -435,12 +452,24 @@ def run_scrape():
 
             # 已存在於 Shopify
             if item['sku'] in existing_skus:
-                # === v2.2: 已上架商品檢查庫存 ===
                 if item['sku'] in collection_skus:
                     product = scrape_product_detail(item['url'])
-                    if product and not product.get('in_stock', True):
-                        out_of_stock_skus.add(item['sku'])
-                        print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                    if product:
+                        if not product.get('in_stock', True):
+                            out_of_stock_skus.add(item['sku'])
+                            print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                        elif product.get('price', 0) >= MIN_COST_THRESHOLD:
+                            new_selling_price = calculate_selling_price(product['price'])
+                            variant_info = existing_data['by_variant'].get(normalize_sku(item['sku']), {})
+                            vid = variant_info.get('variant_id')
+                            if vid and abs(new_selling_price - variant_info.get('price', 0)) >= 1:
+                                requests.put(
+                                    shopify_api_url(f'variants/{vid}.json'),
+                                    headers=get_shopify_headers(),
+                                    json={'variant': {'id': vid,
+                                                      'price': f"{new_selling_price:.2f}",
+                                                      'cost': f"{product['price']:.2f}"}}
+                                )
                     time.sleep(0.5)
                 scrape_status['skipped'] += 1
                 continue

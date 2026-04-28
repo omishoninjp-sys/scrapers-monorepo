@@ -94,10 +94,22 @@ def shopify_api_url(endpoint):
     return f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/{endpoint}"
 
 
-def calculate_selling_price(cost, weight):
+def calculate_selling_price(cost):
     if not cost or cost <= 0: return 0
-    shipping_cost = weight * 1250 if weight else 0
-    return round((cost + shipping_cost) / 0.7)
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def translate_with_chatgpt(title, description):
@@ -366,8 +378,8 @@ def upload_to_shopify(product, collection_id=None):
     if not translated['success']:
         return {'success': False, 'error': 'translation_failed', 'translated': translated}
 
-    cost = product['price']; weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    cost = product['price']
+    selling_price = calculate_selling_price(cost)
 
     images_base64 = []
     for idx, img_url in enumerate(product.get('images', [])):
@@ -381,8 +393,8 @@ def upload_to_shopify(product, collection_id=None):
         'title': translated['title'], 'body_html': translated['description'],
         'vendor': 'Gateau Festa Harada', 'product_type': '法式脆餅',
         'status': 'active', 'published': True,
-        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}", 'weight': weight,
-                      'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
+                      'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
         'images': images_base64,
         'tags': 'Gateau Festa Harada, 日本, 法式脆餅, 伴手禮, 日本代購, 送禮',
         'metafields_global_title_tag': translated['page_title'],

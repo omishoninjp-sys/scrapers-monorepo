@@ -80,9 +80,22 @@ def normalize_sku(sku):
     return sku.strip().lower()
 
 
-def calculate_selling_price(cost, weight):
+def calculate_selling_price(cost):
     if not cost or cost <= 0: return 0
-    return round((cost + (weight * 1250 if weight else 0)) / 0.7)
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def clean_html_for_translation(html_text):
@@ -462,8 +475,8 @@ def upload_to_shopify(product, collection_id=None):
         else:
             print(f"[翻譯驗證] 重試仍含日文，視為失敗")
             return {'success': False, 'error': 'translation_failed', 'translated': translated}
-    cost = product['price']; weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    cost = product['price']
+    selling_price = calculate_selling_price(cost)
     images_b64 = []
     for idx, iu in enumerate(product.get('images', [])):
         if not iu or not iu.startswith('http'): continue
@@ -476,8 +489,8 @@ def upload_to_shopify(product, collection_id=None):
         'title': translated['title'], 'body_html': translated['description'],
         'vendor': 'YOKUMOKU', 'product_type': 'クッキー・洋菓子',
         'status': 'active', 'published': True,
-        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}", 'weight': weight,
-                      'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
+                      'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
         'images': images_b64,
         'tags': 'YOKUMOKU, ヨックモック, 日本, 洋菓子, クッキー, シガール, 伴手禮, 日本代購, 雪茄蛋捲',
         'metafields_global_title_tag': translated['page_title'],

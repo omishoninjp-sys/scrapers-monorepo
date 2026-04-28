@@ -83,9 +83,22 @@ def shopify_api_url(endpoint):
     return f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/{endpoint}"
 
 
-def calculate_selling_price(cost, weight):
+def calculate_selling_price(cost):
     if not cost or cost <= 0: return 0
-    return round((cost + (weight * 1250 if weight else 0)) / 0.7)
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def translate_with_chatgpt(title, description):
@@ -119,10 +132,6 @@ def translate_with_chatgpt(title, description):
                 'title': title, 'description': description, 'page_title': '', 'meta_description': ''}
 
 
-def get_existing_skus():
-    return set(get_existing_products_map().keys())
-
-
 def get_existing_products_map():
     pm = {}
     url = shopify_api_url("products.json?limit=250")
@@ -133,7 +142,12 @@ def get_existing_products_map():
             pid = p.get('id')
             for v in p.get('variants', []):
                 sk = v.get('sku')
-                if sk and pid: pm[sk] = pid
+                if sk and pid:
+                    pm[sk] = {
+                        'product_id': pid,
+                        'variant_id': v.get('id'),
+                        'price': float(v.get('price') or 0),
+                    }
         lh = r.headers.get('Link', '')
         m = re.search(r'<([^>]+)>; rel="next"', lh)
         url = m.group(1) if m and 'rel="next"' in lh else None
@@ -299,15 +313,15 @@ def upload_to_shopify(product, collection_id=None):
     translated = translate_with_chatgpt(product['title'], product.get('description', ''))
     if not translated['success']:
         return {'success': False, 'error': 'translation_failed', 'translated': translated}
-    cost = product['price']; weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    cost = product['price']
+    selling_price = calculate_selling_price(cost)
     images = [{'src': u, 'position': i+1} for i, u in enumerate(product.get('images', []))]
     sp = {'product': {
         'title': translated['title'], 'body_html': translated['description'],
         'vendor': '坂角總本舖', 'product_type': '海老煎餅',
         'status': 'active', 'published': True,
-        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}", 'weight': weight,
-            'weight_unit': 'kg', 'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
+        'variants': [{'sku': product['sku'], 'price': f"{selling_price:.2f}",
+            'inventory_management': None, 'inventory_policy': 'continue', 'requires_shipping': True}],
         'images': images, 'tags': '坂角總本舖, 日本, 海老煎餅, えびせんべい, ゆかり, 伴手禮, 日本零食',
         'metafields_global_title_tag': translated['page_title'],
         'metafields_global_description_tag': translated['meta_description'],
@@ -332,7 +346,8 @@ def run_scrape():
             "filtered_by_price": 0, "deleted": 0,
             "translation_failed": 0, "translation_stopped": False})
         scrape_status['current_product'] = "檢查 Shopify 商品..."
-        existing_skus = get_existing_skus()
+        existing_map = get_existing_products_map()
+        existing_skus = set(existing_map.keys())
         scrape_status['current_product'] = "設定 Collection..."
         collection_id = get_or_create_collection("坂角總本舖")
         scrape_status['current_product'] = "取得 Collection 商品..."
@@ -351,13 +366,25 @@ def run_scrape():
             scrape_status['progress'] = idx + 1
             scrape_status['current_product'] = f"處理: {item['sku']}"
 
-            # 已存在於 Shopify → 需要檢查庫存狀態
+            # 已存在於 Shopify → 確認庫存 + 同步售價
             if item['sku'] in existing_skus:
-                # 如果這個 SKU 也在 collection 裡，爬詳情確認是否缺貨
                 if item['sku'] in collection_skus:
                     product = scrape_product_detail(item['url'])
-                    if product and not product['in_stock']:
-                        out_of_stock_skus.add(item['sku'])
+                    if product:
+                        if not product['in_stock']:
+                            out_of_stock_skus.add(item['sku'])
+                        elif product['price'] >= MIN_COST_THRESHOLD:
+                            new_selling_price = calculate_selling_price(product['price'])
+                            existing_info = existing_map.get(item['sku'], {})
+                            vid = existing_info.get('variant_id')
+                            if vid and abs(new_selling_price - existing_info.get('price', 0)) >= 1:
+                                requests.put(
+                                    shopify_api_url(f'variants/{vid}.json'),
+                                    headers=get_shopify_headers(),
+                                    json={'variant': {'id': vid,
+                                                      'price': f"{new_selling_price:.2f}",
+                                                      'cost': f"{product['price']:.2f}"}}
+                                )
                     time.sleep(0.5)
                 scrape_status['skipped'] += 1
                 continue

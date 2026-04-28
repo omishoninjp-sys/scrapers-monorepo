@@ -130,12 +130,22 @@ def is_japanese_text(text):
     return False
 
 
-def calculate_selling_price(cost, weight):
-    if not cost or cost <= 0:
-        return 0
-    shipping_cost = weight * 1250 if weight else 0
-    price = (cost + shipping_cost) / 0.7
-    return round(price)
+def calculate_selling_price(cost):
+    if not cost or cost <= 0: return 0
+    if cost <= 5000:
+        rate = 1.25
+    elif cost <= 10000:
+        rate = 1.22
+    elif cost <= 20000:
+        rate = 1.20
+    elif cost <= 30000:
+        rate = 1.18
+    else:
+        rate = 1.15
+    fee = round(cost * (rate - 1))
+    if fee < 300:
+        fee = 300
+    return round(cost + fee)
 
 
 def clean_html_for_translation(html_text):
@@ -280,6 +290,7 @@ def get_existing_products_map():
         'by_raw_sku': {},
         'by_source_url': {},
         'by_title_hash': {},
+        'by_variant': {},  # normalized_sku → {variant_id, price} 供售價同步用
     }
     
     url = shopify_api_url("products.json?limit=250&vendor=Cocoris")
@@ -305,6 +316,10 @@ def get_existing_products_map():
                     products_map['by_raw_sku'][raw] = product_id
                     products_map['by_raw_sku'][raw.lower()] = product_id
                     products_map['by_raw_sku'][raw.upper()] = product_id
+                    products_map['by_variant'][normalized] = {
+                        'variant_id': variant.get('id'),
+                        'price': float(variant.get('price') or 0),
+                    }
         
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
@@ -710,8 +725,7 @@ def upload_to_shopify(product, collection_id=None):
     print(f"[翻譯成功] {translated['title'][:30]}...")
     
     cost = product['price']
-    weight = product.get('weight', 0)
-    selling_price = calculate_selling_price(cost, weight)
+    selling_price = calculate_selling_price(cost)
     
     images_base64 = []
     img_urls = product.get('images', [])
@@ -738,8 +752,6 @@ def upload_to_shopify(product, collection_id=None):
             'variants': [{
                 'sku': product['sku'],
                 'price': f"{selling_price:.2f}",
-                'weight': product.get('weight', 0),
-                'weight_unit': 'kg',
                 'inventory_management': None,
                 'inventory_policy': 'continue',
                 'requires_shipping': True
@@ -1486,12 +1498,25 @@ def run_scrape():
             
             # 多層去重檢查 — 已存在於 Shopify
             if sku_exists_in_map(item['sku'], products_map):
-                # === v2.3: 已存在的商品，如果在 collection 裡，爬詳情確認庫存 ===
+                # 已存在的商品：爬詳情確認庫存 + 同步售價
                 if normalized_sku in collection_skus:
                     product = scrape_product_detail(item['url'])
-                    if product and not product.get('in_stock', True):
-                        out_of_stock_skus.add(normalized_sku)
-                        print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                    if product:
+                        if not product.get('in_stock', True):
+                            out_of_stock_skus.add(normalized_sku)
+                            print(f"[缺貨偵測] {item['sku']} 官網缺貨，稍後刪除")
+                        elif product.get('price', 0) >= MIN_PRICE:
+                            new_selling_price = calculate_selling_price(product['price'])
+                            variant_info = products_map['by_variant'].get(normalized_sku, {})
+                            vid = variant_info.get('variant_id')
+                            if vid and abs(new_selling_price - variant_info.get('price', 0)) >= 1:
+                                requests.put(
+                                    shopify_api_url(f'variants/{vid}.json'),
+                                    headers=get_shopify_headers(),
+                                    json={'variant': {'id': vid,
+                                                      'price': f"{new_selling_price:.2f}",
+                                                      'cost': f"{product['price']:.2f}"}}
+                                )
                     time.sleep(0.5)
                 scrape_status['skipped_exists'] += 1
                 scrape_status['skipped'] += 1

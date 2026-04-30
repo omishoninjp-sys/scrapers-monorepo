@@ -523,6 +523,7 @@ def index():
         async function testTranslate(){{log('測試翻譯...');try{{const r=await fetch('/api/test-translate');const d=await r.json();if(d.error)log('✗ '+d.error,'error');else if(d.success)log('✓ '+d.title,'success');else log('✗ 翻譯失敗','error')}}catch(e){{log('✗ '+e.message,'error')}}}}
         async function startScrape(){{clearLog();log('開始爬取...');document.getElementById('startBtn').disabled=true;document.getElementById('progressSection').style.display='block';document.getElementById('translationAlert').style.display='none';try{{const r=await fetch('/api/start',{{method:'POST'}});const d=await r.json();if(!d.success){{log('✗ '+d.error,'error');document.getElementById('startBtn').disabled=false;return}}log('✓ 已啟動','success');pollInterval=setInterval(pollStatus,1000)}}catch(e){{log('✗ '+e.message,'error');document.getElementById('startBtn').disabled=false}}}}
         async function pollStatus(){{try{{const r=await fetch('/api/status');const d=await r.json();const p=d.total>0?(d.progress/d.total*100):0;document.getElementById('progressFill').style.width=p+'%';document.getElementById('statusText').textContent=d.current_product+' ('+d.progress+'/'+d.total+')';document.getElementById('uploadedCount').textContent=d.uploaded;document.getElementById('skippedCount').textContent=d.skipped;document.getElementById('translationFailedCount').textContent=d.translation_failed||0;document.getElementById('filteredCount').textContent=d.filtered_by_price||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors.length;if(d.translation_stopped)document.getElementById('translationAlert').style.display='block';if(!d.running&&d.progress>0){{clearInterval(pollInterval);document.getElementById('startBtn').disabled=false;if(d.translation_stopped)log('⚠️ 翻譯異常停止','error');else log('========== 完成 ==========','success')}}}}catch(e){{console.error(e)}}}}
+        async function updateShipping(){{const b=document.querySelector('[onclick="updateShipping()"]');b.disabled=true;b.textContent='更新中...';try{{const r=await fetch('/api/update-shipping',{{method:'POST'}});const d=await r.json();if(d.error){{alert('錯誤: '+d.error);b.disabled=false;b.textContent='📦 更新運費說明';return}}const poll=setInterval(async()=>{{const sr=await fetch('/api/update-shipping-status');const sd=await sr.json();b.textContent='更新中 '+sd.done+'/'+sd.total+' (跳過'+sd.skipped+')';if(!sd.running){{clearInterval(poll);b.disabled=false;b.textContent='✓ 完成 更新'+sd.done+' 跳過'+sd.skipped+' 錯誤'+sd.errors.length}}}},1500)}}catch(e){{alert(e.message);b.disabled=false;b.textContent='📦 更新運費說明'}}}}
     </script>
 </body></html>'''
 
@@ -597,7 +598,11 @@ def run_scrape():
 
         scrape_status['current_product'] = "正在取得 Collection 內商品..."
         collection_products_map = get_collection_products_map(collection_id)
-        existing_skus = set(collection_products_map.keys())
+        collection_skus = set(collection_products_map.keys())
+
+        scrape_status['current_product'] = "正在取得全站已有商品（去重用）..."
+        all_products_map = get_existing_products_map()
+        existing_skus = set(all_products_map.keys())
 
         scrape_status['current_product'] = "正在爬取商品列表..."
         product_list = scrape_product_list()
@@ -661,7 +666,7 @@ def run_scrape():
             # === v2.2: 合併需要刪除的 SKU ===
             # 1. 官網已消失的 SKU（collection 有但官網沒有）
             # 2. 官網還在但缺貨的 SKU
-            skus_to_delete = (existing_skus - website_skus) | (existing_skus & out_of_stock_skus)
+            skus_to_delete = (collection_skus - website_skus) | (collection_skus & out_of_stock_skus)
 
             if skus_to_delete:
                 print(f"[v2.2] 準備刪除 {len(skus_to_delete)} 個商品")

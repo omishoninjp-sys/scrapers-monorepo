@@ -488,7 +488,7 @@ def index():
         <h3>Shopify 連線狀態</h3><p>Token: {token_status}</p>
         <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
         <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
-        <a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a>
+        <a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a> <button class="btn" style="background:#2ecc71" onclick="updateShipping()">📦 更新運費說明</button>
     </div>
     <div class="card">
         <h3>開始爬取</h3>

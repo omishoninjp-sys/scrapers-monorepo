@@ -718,7 +718,7 @@ def index():
 <div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:__TC__;">__TS__</span></p>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
-<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a></div>
+<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a> <button class="btn" style="background:#2ecc71" onclick="updateShipping()">📦 更新運費說明</button></div>
 <div class="card"><h3>🔄 同步清理（僅刪除下架商品）</h3>
 <p style="color:#666;font-size:14px">※ 比對官網，刪除已下架商品。不會上架新品。</p>
 <button class="btn" style="background:#e67e22" id="syncBtn" onclick="syncDelete()">🧹 立即同步清理</button>

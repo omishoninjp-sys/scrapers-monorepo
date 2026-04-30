@@ -523,7 +523,7 @@ def index():
 <div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:__TC__;">__TS__</span></p>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
-<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a></div>
+<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a> <button class="btn" style="background:#2ecc71" onclick="updateShipping()">📦 更新運費說明</button></div>
 <div class="card"><h3>開始爬取</h3>
 <p style="color:#666;font-size:14px">※ &lt;¥1000 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止 | <b style="color:#e67e22">缺貨自動刪除</b></p>
 <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>

@@ -700,7 +700,7 @@ def index():
 <div class="formula">售價 = (成本價 + 重量 × 1250) / 0.7<br>重量 = max(材積重量, 實際重量)</div>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
-<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a></div>
+<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a> <button class="btn" style="background:#2ecc71" onclick="updateShipping()">📦 更新運費說明</button></div>
 <div class="card"><h3>開始爬取</h3>
 <p style="color:#666;font-size:14px">※ 排除冷凍商品 | &lt;¥__MIN_COST__ 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止 | <b style="color:#e67e22">缺貨自動刪除</b><br>⚠️ 使用 Playwright 無頭瀏覽器，商品列表載入需要較長時間</p>
 <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>

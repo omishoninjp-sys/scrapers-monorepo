@@ -369,16 +369,21 @@ def run_scrape():
         scrape_status['current_product'] = "設定 Collection..."
         collection_id = get_or_create_collection("小倉山莊")
 
+        # 用全站 existing_map 做去重，避免 collection 為空時重複上架
+        scrape_status['current_product'] = "取得 Shopify 現有商品..."
+        existing_map = get_existing_products_map()
+        existing_skus = set(existing_map.keys())
+
+        # 另外取 collection 內商品，用於刪除比對
         scrape_status['current_product'] = "取得 Collection 商品..."
         cpm = get_collection_products_map(collection_id)
-        existing_skus = set(cpm.keys())
+        collection_skus = set(cpm.keys())
 
         scrape_status['current_product'] = "爬取官網商品列表..."
         product_list = scrape_product_list(CATEGORY_URL)
         scrape_status['total'] = len(product_list)
         website_skus = set(item['sku'] for item in product_list)
 
-        # === v2.2: 記錄缺貨的 SKU ===
         out_of_stock_skus = set()
         ctf = 0
 
@@ -392,7 +397,6 @@ def run_scrape():
                 scrape_status['errors'].append(f"爬取失敗: {sku}")
                 time.sleep(0.5); continue
 
-            # === v2.2: 缺貨 → 記錄 SKU ===
             if not product['in_stock'] or product['price'] < 1000:
                 if not product['in_stock']:
                     out_of_stock_skus.add(sku)
@@ -400,8 +404,20 @@ def run_scrape():
                 scrape_status['skipped'] += 1
                 time.sleep(0.5); continue
 
-            # 已存在 → 跳過（有庫存的不需處理）
+            # 已存在 → 更新售價 + 跳過
             if sku in existing_skus:
+                if sku in collection_skus and product['price'] >= 1000:
+                    new_selling_price = calculate_selling_price(product['price'])
+                    variant_info = existing_map.get(sku, {})
+                    vid = variant_info.get('variant_id')
+                    if vid and abs(new_selling_price - variant_info.get('price', 0)) >= 1:
+                        requests.put(
+                            shopify_api_url(f'variants/{vid}.json'),
+                            headers=get_shopify_headers(),
+                            json={'variant': {'id': vid,
+                                              'price': f"{new_selling_price:.2f}",
+                                              'cost': f"{product['price']:.2f}"}}
+                        )
                 scrape_status['skipped'] += 1
                 time.sleep(0.5); continue
 
@@ -420,19 +436,15 @@ def run_scrape():
                 scrape_status['errors'].append(f"上傳失敗 {sku}"); ctf = 0
             time.sleep(1)
 
-        # === v2.2: 合併需要刪除的 SKU ===
         if not scrape_status['translation_stopped']:
             scrape_status['current_product'] = "清理缺貨/下架商品..."
-
-            # 1. 官網已消失的 SKU
-            # 2. 官網還在但缺貨的 SKU
-            skus_to_delete = (existing_skus - website_skus) | (existing_skus & out_of_stock_skus)
-
+            skus_to_delete = (collection_skus - website_skus) | (collection_skus & out_of_stock_skus)
             if skus_to_delete:
                 print(f"[v2.2] 準備刪除 {len(skus_to_delete)} 個商品")
                 for sku in skus_to_delete:
                     scrape_status['current_product'] = f"刪除: {sku}"
-                    pid = cpm.get(sku)
+                    info = cpm.get(sku)
+                    pid = info.get('product_id') if isinstance(info, dict) else info
                     if pid:
                         if delete_product(pid):
                             scrape_status['deleted'] += 1

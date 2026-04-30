@@ -701,6 +701,25 @@ def index():
                 }}
             }} catch(e) {{ console.error(e); }}
         }}
+        async function updateShipping() {{
+            const b = document.querySelector('[onclick="updateShipping()"]');
+            b.disabled = true; b.textContent = '更新中...';
+            try {{
+                const r = await fetch('/api/update-shipping', {{method: 'POST'}});
+                const d = await r.json();
+                if (d.error) {{ alert('錯誤: ' + d.error); b.disabled=false; b.textContent='📦 更新運費說明'; return; }}
+                const poll = setInterval(async () => {{
+                    const sr = await fetch('/api/update-shipping-status');
+                    const sd = await sr.json();
+                    b.textContent = '更新中 ' + sd.done + '/' + sd.total + ' (跳過' + sd.skipped + ')';
+                    if (!sd.running) {{
+                        clearInterval(poll);
+                        b.disabled = false;
+                        b.textContent = '✓ 完成 更新' + sd.done + ' 跳過' + sd.skipped + ' 錯誤' + sd.errors.length;
+                    }}
+                }}, 1500);
+            }} catch(e) {{ alert(e.message); b.disabled=false; b.textContent='📦 更新運費說明'; }}
+        }}
     </script>
 </body>
 </html>'''

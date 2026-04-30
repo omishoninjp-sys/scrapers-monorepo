@@ -449,18 +449,23 @@ def run_update_shipping():
     global update_shipping_status
     update_shipping_status = {"running": True, "done": 0, "total": 0, "skipped": 0, "errors": []}
     try:
-        collection_id = get_or_create_collection("砂糖奶油樹")
-        cpm = get_collection_products_map(collection_id)
-        pids = list(set(cpm.values()))
+        # 用 vendor 篩選，不依賴 collection 名稱
+        pids = []
+        url = shopify_api_url("products.json?limit=250&vendor=砂糖奶油樹&fields=id,body_html")
+        while url:
+            r = requests.get(url, headers=get_shopify_headers())
+            if r.status_code != 200:
+                update_shipping_status["errors"].append(f"取得商品列表失敗: {r.status_code}")
+                break
+            for p in r.json().get("products", []):
+                pids.append((p["id"], p.get("body_html", "") or ""))
+            lh = r.headers.get("Link", "")
+            import re as _re
+            m = _re.search(r'<([^>]+)>; rel="next"', lh)
+            url = m.group(1) if m else None
         update_shipping_status["total"] = len(pids)
-        for pid in pids:
+        for pid, body in pids:
             try:
-                r = requests.get(shopify_api_url(f"products/{pid}.json"), headers=get_shopify_headers())
-                if r.status_code != 200:
-                    update_shipping_status["errors"].append(f"取得失敗 {pid}")
-                    continue
-                product = r.json().get("product", {})
-                body = product.get("body_html", "") or ""
                 if "國際運費" in body:
                     update_shipping_status["skipped"] += 1
                     continue

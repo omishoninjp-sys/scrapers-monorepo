@@ -460,6 +460,178 @@ def run_scrape():
         scrape_status['running'] = False
 
 
+# ========== 重複商品清理 ==========
+
+dedup_status = {"running": False, "scanned": 0, "duplicate_groups": 0, "to_delete": 0, "deleted": 0, "errors": [], "done": False}
+
+
+def get_duplicate_groups():
+    products = []
+    url = shopify_api_url("products.json?limit=250&vendor=小倉山荘&fields=id,title,variants,created_at,image")
+    while url:
+        r = requests.get(url, headers=get_shopify_headers())
+        if r.status_code != 200: break
+        for p in r.json().get('products', []):
+            sku = ''
+            for v in p.get('variants', []): sku = v.get('sku', ''); break
+            products.append({'id': p.get('id'), 'title': p.get('title', ''), 'sku': sku,
+                             'created_at': p.get('created_at', ''),
+                             'image': p.get('image', {}).get('src', '') if p.get('image') else ''})
+        lh = r.headers.get('Link', '')
+        m = re.search(r'<([^>]+)>; rel="next"', lh)
+        url = m.group(1) if m and 'rel="next"' in lh else None
+    sku_groups = {}
+    for p in products:
+        sku = p.get('sku', '')
+        if not sku: continue
+        sku_groups.setdefault(sku, []).append(p)
+    duplicates = []
+    for sku, group in sku_groups.items():
+        if len(group) >= 2:
+            group.sort(key=lambda x: x.get('created_at', ''))
+            duplicates.append({'sku': sku, 'keep': group[0], 'delete': group[1:]})
+    return products, duplicates
+
+
+def run_dedup():
+    global dedup_status
+    dedup_status = {"running": True, "scanned": 0, "duplicate_groups": 0, "to_delete": 0, "deleted": 0, "errors": [], "done": False}
+    try:
+        products, duplicates = get_duplicate_groups()
+        dedup_status["scanned"] = len(products)
+        dedup_status["duplicate_groups"] = len(duplicates)
+        dedup_status["to_delete"] = sum(len(g['delete']) for g in duplicates)
+        for group in duplicates:
+            for p in group['delete']:
+                if delete_product(p['id']):
+                    dedup_status["deleted"] += 1
+                else:
+                    dedup_status["errors"].append(f"刪除失敗 ID:{p['id']} SKU:{group['sku']}")
+                time.sleep(0.3)
+    except Exception as e:
+        dedup_status["errors"].append(str(e))
+    finally:
+        dedup_status["running"] = False
+        dedup_status["done"] = True
+
+
+@app.route('/dedup-scan')
+def dedup_scan_page():
+    return '''<!DOCTYPE html>
+<html lang="zh-TW">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>重複商品清理 - 小倉山莊</title>
+<style>*{box-sizing:border-box}body{font-family:-apple-system,sans-serif;max-width:960px;margin:0 auto;padding:20px;background:#f5f5f5}h1{color:#333;border-bottom:2px solid #e74c3c;padding-bottom:10px}.card{background:white;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 2px 4px rgba(0,0,0,.1)}.btn{border:none;padding:11px 22px;border-radius:5px;cursor:pointer;font-size:15px;color:white;margin-right:8px;margin-bottom:8px}.btn:disabled{background:#ccc!important;cursor:not-allowed}.btn-red{background:#e74c3c}.btn-blue{background:#3498db}.btn-green{background:#27ae60}.nav{margin-bottom:20px}.nav a{margin-right:15px;color:#e74c3c;text-decoration:none;font-weight:bold}.stats{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}.stat{flex:1;min-width:100px;text-align:center;padding:16px;background:#f8f9fa;border-radius:8px}.stat-num{font-size:28px;font-weight:bold}.stat-label{font-size:11px;color:#666;margin-top:4px}.group{border:1px solid #e74c3c;border-radius:8px;margin-bottom:12px;overflow:hidden}.group-header{background:#fee;padding:10px 15px;font-weight:bold;color:#c0392b;font-size:13px}.product-row{display:flex;align-items:center;padding:10px 15px;border-top:1px solid #eee;gap:12px}.product-row.keep{background:#f0fff0}.product-row img{width:48px;height:48px;object-fit:cover;border-radius:4px}.no-img{width:48px;height:48px;background:#eee;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:10px;color:#999}.info{flex:1;font-size:12px}.info .title{font-weight:bold;margin-bottom:3px;font-size:13px}.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold;margin-left:6px}.badge-keep{background:#27ae60;color:white}.badge-del{background:#e74c3c;color:white}.progress-bar{width:100%;height:8px;background:#eee;border-radius:4px;margin:8px 0}.progress-fill{height:100%;background:#e74c3c;border-radius:4px;transition:width .3s}</style>
+</head>
+<body>
+<div class="nav"><a href="/">🏠 首頁</a><a href="/dedup-scan">🗑️ 重複清理</a><a href="/japanese-scan">🇯🇵 日文掃描</a></div>
+<h1>🗑️ 重複商品清理 - 小倉山莊</h1>
+<div class="card">
+  <p style="color:#666;font-size:14px">掃描 Shopify 中小倉山荘的重複商品（同 SKU），保留最早上架的，刪除其餘重複。</p>
+  <button class="btn btn-blue" id="scanBtn" onclick="startScan()">🔍 掃描重複商品</button>
+  <button class="btn btn-red" id="deleteBtn" onclick="startDelete()" disabled>🗑️ 一鍵刪除全部重複</button>
+  <span id="statusText" style="font-size:13px;color:#666;margin-left:8px"></span>
+</div>
+<div class="stats" id="statsSection" style="display:none">
+  <div class="stat"><div class="stat-num" id="statScanned" style="color:#3498db">-</div><div class="stat-label">掃描商品數</div></div>
+  <div class="stat"><div class="stat-num" id="statGroups" style="color:#e74c3c">-</div><div class="stat-label">重複群組</div></div>
+  <div class="stat"><div class="stat-num" id="statToDelete" style="color:#e67e22">-</div><div class="stat-label">待刪除數</div></div>
+  <div class="stat"><div class="stat-num" id="statDeleted" style="color:#27ae60">-</div><div class="stat-label">已刪除</div></div>
+</div>
+<div class="progress-bar" id="progressBar" style="display:none"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+<div id="results"></div>
+<script>
+let pollTimer = null;
+async function startScan() {
+  document.getElementById("scanBtn").disabled = true;
+  document.getElementById("deleteBtn").disabled = true;
+  document.getElementById("statusText").textContent = "掃描中...";
+  document.getElementById("statsSection").style.display = "none";
+  document.getElementById("results").innerHTML = "";
+  try {
+    const r = await fetch("/api/scan-duplicates");
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    document.getElementById("statScanned").textContent = d.total;
+    document.getElementById("statGroups").textContent = d.duplicate_groups;
+    document.getElementById("statToDelete").textContent = d.to_delete;
+    document.getElementById("statDeleted").textContent = "-";
+    document.getElementById("statsSection").style.display = "flex";
+    document.getElementById("statusText").textContent = d.to_delete === 0 ? "✓ 沒有重複商品" : "";
+    renderGroups(d.duplicates.slice(0, 50));
+    if (d.duplicates.length > 50)
+      document.getElementById("results").innerHTML += "<p style=\\"color:#888;text-align:center;font-size:13px\\">顯示前 50 組，共 " + d.duplicates.length + " 組</p>";
+    document.getElementById("deleteBtn").disabled = d.to_delete === 0;
+  } catch(e) { alert(e.message); }
+  finally { document.getElementById("scanBtn").disabled = false; }
+}
+function renderGroups(groups) {
+  document.getElementById("results").innerHTML = groups.map(g => {
+    const k = g.keep;
+    let html = "<div class=\\"group\\"><div class=\\"group-header\\">SKU: " + g.sku + "（共 " + (g.delete.length+1) + " 個，刪除 " + g.delete.length + " 個）</div>";
+    html += "<div class=\\"product-row keep\\">" + (k.image ? "<img src=\\"" + k.image + "\\">" : "<div class=\\"no-img\\">無圖</div>") + "<div class=\\"info\\"><div class=\\"title\\">" + k.title + " <span class=\\"badge badge-keep\\">保留</span></div><div>" + k.created_at.substring(0,10) + "</div></div></div>";
+    g.delete.forEach(p => {
+      html += "<div class=\\"product-row\\">" + (p.image ? "<img src=\\"" + p.image + "\\">" : "<div class=\\"no-img\\">無圖</div>") + "<div class=\\"info\\"><div class=\\"title\\">" + p.title + " <span class=\\"badge badge-del\\">刪除</span></div><div>" + p.created_at.substring(0,10) + "</div></div></div>";
+    });
+    return html + "</div>";
+  }).join("");
+}
+async function startDelete() {
+  if (!confirm("確定刪除全部重複商品？此操作不可復原。")) return;
+  document.getElementById("deleteBtn").disabled = true;
+  document.getElementById("scanBtn").disabled = true;
+  document.getElementById("progressBar").style.display = "block";
+  document.getElementById("progressFill").style.width = "0%";
+  document.getElementById("statusText").textContent = "刪除中...";
+  try {
+    const r = await fetch("/api/delete-duplicates", {method: "POST"});
+    const d = await r.json();
+    if (d.error) { alert(d.error); document.getElementById("scanBtn").disabled = false; return; }
+    pollTimer = setInterval(pollDeleteStatus, 1500);
+  } catch(e) { alert(e.message); document.getElementById("scanBtn").disabled = false; }
+}
+async function pollDeleteStatus() {
+  try {
+    const r = await fetch("/api/dedup-status");
+    const d = await r.json();
+    const pct = d.to_delete > 0 ? Math.round(d.deleted / d.to_delete * 100) : 0;
+    document.getElementById("progressFill").style.width = pct + "%";
+    document.getElementById("statDeleted").textContent = d.deleted;
+    document.getElementById("statusText").textContent = "刪除中 " + d.deleted + "/" + d.to_delete + "，錯誤 " + d.errors.length;
+    if (!d.running && d.done) {
+      clearInterval(pollTimer);
+      document.getElementById("progressFill").style.width = "100%";
+      document.getElementById("statusText").textContent = "✓ 完成！刪除 " + d.deleted + " 個，錯誤 " + d.errors.length + " 個";
+      document.getElementById("scanBtn").disabled = false;
+    }
+  } catch(e) { console.error(e); }
+}
+</script>
+</body></html>'''
+
+
+@app.route('/api/scan-duplicates')
+def api_scan_duplicates():
+    if not load_shopify_token(): return jsonify({'error': '未設定 Token'}), 400
+    products, duplicates = get_duplicate_groups()
+    to_delete = sum(len(g['delete']) for g in duplicates)
+    return jsonify({'total': len(products), 'duplicate_groups': len(duplicates), 'to_delete': to_delete, 'duplicates': duplicates})
+
+
+@app.route('/api/delete-duplicates', methods=['POST'])
+def api_delete_duplicates():
+    if not load_shopify_token(): return jsonify({'error': '未設定 Token'}), 400
+    if dedup_status.get('running'): return jsonify({'error': '清理已在進行中'}), 400
+    import threading
+    threading.Thread(target=run_dedup, daemon=True).start()
+    return jsonify({'message': '開始清理重複商品'})
+
+
+@app.route('/api/dedup-status')
+def api_dedup_status():
+    return jsonify(dedup_status)
+
+
 # ========== Flask 路由 ==========
 
 
@@ -540,7 +712,7 @@ def index():
 <div class="card"><h3>Shopify 連線</h3><p>Token: <span style="color:__TC__;">__TS__</span></p>
 <button class="btn btn-secondary" onclick="testShopify()">測試連線</button>
 <button class="btn btn-secondary" onclick="testTranslate()">測試翻譯</button>
-<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a> <button class="btn" style="background:#2ecc71" onclick="updateShipping()">📦 更新運費說明</button></div>
+<a href="/japanese-scan" class="btn btn-success">🇯🇵 日文掃描</a> <a href="/dedup-scan" class="btn" style="background:#e74c3c">🗑️ 重複清理</a> <button class="btn" style="background:#2ecc71" onclick="updateShipping()">📦 更新運費說明</button></div>
 <div class="card"><h3>開始爬取</h3>
 <p style="color:#666;font-size:14px">※ &lt;¥1000 跳過 | <b style="color:#e74c3c">翻譯保護</b> 連續失敗 __MAX_FAIL__ 次停止 | <b style="color:#e67e22">缺貨自動刪除</b></p>
 <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>

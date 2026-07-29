@@ -237,18 +237,47 @@ def parse_dimension_weight(html_content):
     return {"dimension": dimension, "actual_weight": weight, "final_weight": round(final, 2)}
 
 
-def check_product_in_stock(soup, page_text):
-    for kw in ['在庫がありません','在庫：×','在庫切れ','売り切れ','品切れ','完売','販売終了',
-               'SOLD OUT','sold out','ただ今お取扱いできない商品です']:
-        if kw in page_text: return False
-    sm = re.search(r'在庫[：:]\s*([○△×])', page_text)
+RELATED_BLOCK_PREFIXES = ('block-thumbnail', 'block-recommend', 'block-history',
+                          'block-cart-in', 'block-together', 'block-ranking')
+
+
+def _is_in_related_block(el):
+    """判斷節點是否位於「推薦商品／一起購買／瀏覽紀錄」等縮圖區塊內"""
+    for parent in el.parents:
+        for c in (parent.get('class') or []):
+            if c.startswith(RELATED_BLOCK_PREFIXES):
+                return True
+    return False
+
+
+def check_product_in_stock(soup, page_text=None):
+    """只依主商品區塊判斷庫存，避免被推薦商品縮圖的缺貨標記誤判"""
+    main = soup.select_one('div.block-goods-detail') or soup
+    main_text = main.get_text()
+
+    # 1) 主商品的「在庫：○／△／×」最準，優先採用
+    sm = re.search(r'在庫[：:]\s*([○△×])', main_text)
     if sm:
-        if sm.group(1) == '×': return False
-        if sm.group(1) in ('○','△'): return True
-    cart = soup.select_one('a[href*="cart.aspx?goods="],.block-cart-btn')
-    if not cart and '買い物かごに入れる' not in page_text: return False
-    if 'ご指定の商品は販売終了か' in page_text: return False
-    if soup.select_one('.sold-out,.out-of-stock,.stock-none'): return False
+        return sm.group(1) != '×'
+
+    # 2) 沒有庫存記號時，看主區塊內的缺貨標記（排除推薦商品縮圖）
+    for ns in main.select('.block-no-stock, .sold-out, .out-of-stock, .stock-none'):
+        if not _is_in_related_block(ns):
+            return False
+
+    # 3) 最後才用文字關鍵字（同樣排除推薦商品區塊）
+    scoped = main_text
+    for th in main.select('ul.block-thumbnail-t, .block-thumbnail-t, .block-recommend, .block-history'):
+        scoped = scoped.replace(th.get_text(), '')
+    for kw in ['在庫がありません', '在庫切れ', '売り切れ', '品切れ', '完売', '販売終了',
+               'SOLD OUT', 'sold out', 'ただ今お取扱いできない商品です',
+               'ご指定の商品は販売終了か']:
+        if kw in scoped:
+            return False
+
+    cart = main.select_one('a[href*="cart.aspx?goods="],.block-cart-btn')
+    if not cart and '買い物かごに入れる' not in scoped:
+        return False
     return True
 
 

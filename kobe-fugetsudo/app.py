@@ -140,7 +140,7 @@ def translate_with_chatgpt(title, description):
 商品說明：{description[:1500]}
 
 只回傳此 JSON 格式，不加 markdown、不加任何其他文字：
-{"title":"翻譯後的商品名稱","description":"翻譯後的商品說明（HTML格式）","page_title":"SEO標題50字以內","meta_description":"SEO描述100字以內"}
+{{"title":"翻譯後的商品名稱","description":"翻譯後的商品說明（HTML格式）","page_title":"SEO標題50字以內","meta_description":"SEO描述100字以內"}}
 
 規則：
 1. 品牌背景：日本神戶創業 1897 年的法蘭酥名店

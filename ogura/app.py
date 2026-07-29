@@ -18,6 +18,21 @@ import threading
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'))
 
+
+@app.errorhandler(Exception)
+def handle_api_error(e):
+    """/api/* 一律回 JSON，避免前端 r.json() 收到 HTML 錯誤頁"""
+    from werkzeug.exceptions import HTTPException
+    code = e.code if isinstance(e, HTTPException) else 500
+    if request.path.startswith('/api/'):
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'{type(e).__name__}: {e}', 'status': code}), code
+    if isinstance(e, HTTPException):
+        return e
+    raise e
+
+
 SHOPIFY_SHOP = ""
 SHOPIFY_ACCESS_TOKEN = ""
 BASE_URL = "https://www.ogurasansou.co.jp"
@@ -25,6 +40,7 @@ CATEGORY_URL = "https://www.ogurasansou.co.jp/shop/c/c10/"
 MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3
 SHIPPING_HTML = '<div style="margin-top:24px;border-top:1px solid #e8eaf0;padding-top:20px;"><h2 style="font-size:16px;font-weight:700;color:#1a1a2e;border-bottom:2px solid #e8eaf0;padding-bottom:8px;margin:0 0 16px;">國際運費（空運・包稅）</h2><p style="margin:0 0 6px;font-size:13px;color:#444;">✓ 含關稅\u3000✓ 含台灣配送費\u3000✓ 只收實重\u3000✓ 無材積費</p><p style="margin:0 0 12px;font-size:13px;color:#444;">起運 1 kg，未滿 1 kg 以 1 kg 計算，每增加 0.5 kg 加收 ¥500。</p><table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:10px;"><tbody><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">≦ 1.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,000 <span style="color:#888;font-weight:400;">≈ NT$200</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.1 ～ 1.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥1,500 <span style="color:#888;font-weight:400;">≈ NT$300</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">1.6 ～ 2.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,000 <span style="color:#888;font-weight:400;">≈ NT$400</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.1 ～ 2.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥2,500 <span style="color:#888;font-weight:400;">≈ NT$500</span></td></tr><tr style="background:#f0f4ff;"><td style="padding:9px 14px;border:1px solid #dde3f0;">2.6 ～ 3.0 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;font-weight:600;">¥3,000 <span style="color:#888;font-weight:400;">≈ NT$600</span></td></tr><tr style="background:#fff;"><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">每增加 0.5 kg</td><td style="padding:9px 14px;border:1px solid #dde3f0;color:#555;">+¥500\u3000<span style="color:#888;">+≈ NT$100</span></td></tr></tbody></table><p style="margin:0 0 28px;font-size:12px;color:#999;">NT$ 匯率僅供參考，實際以下單當日匯率為準。運費於商品到倉後出貨前確認重量後統一請款。</p></div>'
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "gpt-4o-mini")
 
 BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -118,7 +134,7 @@ def translate_with_chatgpt(title, description):
     try:
         r = requests.post("https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "gpt-4o-mini", "messages": [
+            json={"model": TRANSLATE_MODEL, "messages": [
                 {"role": "system", "content": "你是專業的日本商品翻譯和 SEO 專家。"},
                 {"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 1000}, timeout=60)
         if r.status_code == 200:
@@ -758,7 +774,7 @@ def index():
 <div class="stat"><div class="stat-number" id="errorCount" style="color:#e74c3c">0</div><div class="stat-label">錯誤</div></div>
 </div></div></div>
 <div class="card"><h3>執行日誌</h3><div class="log" id="logArea">等待開始...</div></div>
-<script>let pollInterval=null;function log(m,t){const l=document.getElementById('logArea');const tm=new Date().toLocaleTimeString();const c={success:'#4ec9b0',error:'#f14c4c'}[t]||'#d4d4d4';l.innerHTML+='<div style="color:'+c+'">['+tm+'] '+m+'</div>';l.scrollTop=l.scrollHeight}function clearLog(){document.getElementById('logArea').innerHTML=''}async function testShopify(){log('測試連線...');try{const r=await fetch('/api/test-shopify');const d=await r.json();if(d.success)log('✓ '+d.shop.name,'success');else log('✗ '+d.error,'error')}catch(e){log('✗ '+e.message,'error')}}async function testTranslate(){log('測試翻譯...');try{const r=await fetch('/api/test-translate');const d=await r.json();if(d.error)log('✗ '+d.error,'error');else if(d.success)log('✓ '+d.title,'success');else log('✗ 翻譯失敗','error')}catch(e){log('✗ '+e.message,'error')}}async function startScrape(){clearLog();log('開始爬取...');document.getElementById('startBtn').disabled=true;document.getElementById('progressSection').style.display='block';document.getElementById('translationAlert').style.display='none';try{const r=await fetch('/api/start',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');document.getElementById('startBtn').disabled=false;return}log('✓ 已啟動','success');pollInterval=setInterval(pollStatus,1000)}catch(e){log('✗ '+e.message,'error');document.getElementById('startBtn').disabled=false}}async function pollStatus(){try{const r=await fetch('/api/status');const d=await r.json();const p=d.total>0?(d.progress/d.total*100):0;document.getElementById('progressFill').style.width=p+'%';document.getElementById('statusText').textContent=d.current_product+' ('+d.progress+'/'+d.total+')';document.getElementById('uploadedCount').textContent=d.uploaded;document.getElementById('skippedCount').textContent=d.skipped;document.getElementById('translationFailedCount').textContent=d.translation_failed||0;document.getElementById('outOfStockCount').textContent=d.out_of_stock||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors.length;if(d.translation_stopped)document.getElementById('translationAlert').style.display='block';if(!d.running&&d.progress>0){clearInterval(pollInterval);document.getElementById('startBtn').disabled=false;if(d.translation_stopped)log('⚠️ 翻譯異常停止','error');else log('========== 完成 ==========','success')}}catch(e){console.error(e)}}
+<script>let pollInterval=null;function log(m,t){const l=document.getElementById('logArea');const tm=new Date().toLocaleTimeString();const c={success:'#4ec9b0',error:'#f14c4c'}[t]||'#d4d4d4';l.innerHTML+='<div style="color:'+c+'">['+tm+'] '+m+'</div>';l.scrollTop=l.scrollHeight}function clearLog(){document.getElementById('logArea').innerHTML=''}async function testShopify(){log('測試連線...');try{const r=await fetch('/api/test-shopify');const t=await r.text();let d;try{d=JSON.parse(t)}catch(pe){log('✗ HTTP '+r.status+' 非 JSON 回應：'+t.slice(0,300),'error');return}if(d.success)log('✓ '+d.shop.name,'success');else log('✗ HTTP '+r.status+' '+(d.error||JSON.stringify(d).slice(0,300)),'error')}catch(e){log('✗ '+e.message,'error')}}async function testTranslate(){log('測試翻譯...');try{const r=await fetch('/api/test-translate');const t=await r.text();let d;try{d=JSON.parse(t)}catch(pe){log('✗ HTTP '+r.status+' 非 JSON 回應：'+t.slice(0,300),'error');return}if(d.error)log('✗ HTTP '+r.status+' '+d.error,'error');else if(d.success)log('✓ '+d.title+'（model: '+(d.model||'?')+'）','success');else log('✗ 翻譯失敗：'+JSON.stringify(d).slice(0,300),'error')}catch(e){log('✗ '+e.message,'error')}}async function startScrape(){clearLog();log('開始爬取...');document.getElementById('startBtn').disabled=true;document.getElementById('progressSection').style.display='block';document.getElementById('translationAlert').style.display='none';try{const r=await fetch('/api/start',{method:'POST'});const d=await r.json();if(d.error){log('✗ '+d.error,'error');document.getElementById('startBtn').disabled=false;return}log('✓ 已啟動','success');pollInterval=setInterval(pollStatus,1000)}catch(e){log('✗ '+e.message,'error');document.getElementById('startBtn').disabled=false}}async function pollStatus(){try{const r=await fetch('/api/status');const d=await r.json();const p=d.total>0?(d.progress/d.total*100):0;document.getElementById('progressFill').style.width=p+'%';document.getElementById('statusText').textContent=d.current_product+' ('+d.progress+'/'+d.total+')';document.getElementById('uploadedCount').textContent=d.uploaded;document.getElementById('skippedCount').textContent=d.skipped;document.getElementById('translationFailedCount').textContent=d.translation_failed||0;document.getElementById('outOfStockCount').textContent=d.out_of_stock||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors.length;if(d.translation_stopped)document.getElementById('translationAlert').style.display='block';if(!d.running&&d.progress>0){clearInterval(pollInterval);document.getElementById('startBtn').disabled=false;if(d.translation_stopped)log('⚠️ 翻譯異常停止','error');else log('========== 完成 ==========','success')}}catch(e){console.error(e)}}
         async function updateShipping() {
             const b = document.querySelector('[onclick=\"updateShipping()\"]');
             b.disabled = true; b.textContent = '更新中...';
@@ -845,12 +861,18 @@ def api_delete_product():
 
 @app.route('/api/test-translate')
 def api_test_translate():
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key: return jsonify({'error': 'OPENAI_API_KEY 未設定'})
-    kp = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else "太短"
-    result = translate_with_chatgpt("をぐら山春秋 化粧箱", "京都小倉山莊の代表的な米菓の詰め合わせです")
-    result['key_preview'] = kp; result['key_length'] = len(api_key)
-    return jsonify(result)
+    try:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key: return jsonify({'error': 'OPENAI_API_KEY 未設定'})
+        kp = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else "太短"
+        result = translate_with_chatgpt("をぐら山春秋 化粧箱", "京都小倉山莊の代表的な米菓の詰め合わせです")
+        result['key_preview'] = kp; result['key_length'] = len(api_key)
+        result['model'] = TRANSLATE_MODEL
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'{type(e).__name__}: {e}'})
 
 
 @app.route('/api/status')
@@ -881,7 +903,7 @@ def test_shopify():
 if __name__ == '__main__':
     os.makedirs('templates', exist_ok=True)
     print("=" * 50)
-    print("小倉山莊爬蟲工具 v2.2（缺貨自動刪除）")
+    print("小倉山莊爬蟲工具 v2.3（庫存判定修正 + API 錯誤 JSON 化）")
     print("=" * 50)
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)

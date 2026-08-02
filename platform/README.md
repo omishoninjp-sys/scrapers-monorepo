@@ -63,6 +63,8 @@ brands/
 | `SHOPIFY_API_VERSION` | | `2024-01` | **見下方警告** |
 | `OPENAI_API_KEY` | ✔ | — | |
 | `SYNC_TOKEN` | 建議 | 空 | 設了才需帶 token 觸發同步 |
+| `SCHEDULER_ENABLED` | | `1` | 本機測試時設 `0`，避免誤觸正式資料 |
+| `MAX_CONSECUTIVE_ERRORS` | | `8` | 連續幾件爬取失敗就中止本輪 |
 | `TRANSLATE_MODEL` | | `gpt-4o-mini` | |
 | `MAX_CONSECUTIVE_TRANSLATION_FAILURES` | | `3` | |
 | `DRY_RUN` | | 關 | `1` 則完全不寫入 Shopify（含不建立 collection）|
@@ -84,6 +86,37 @@ brands/
 要升版必須同時把 `ShopifyClient.create_product` 改走 GraphQL `productSet` mutation。
 `sync.py` 已經在 Shopify 沒回傳 variant 時記錄警告，就是為了讓這個問題不再無聲發生。
 這是獨立的工作項，不要和這次遷移混在一起做。
+
+## 排程器
+
+品牌用 `schedule = "10:00"`（**日本時間**）宣告每日同步，`None` 表示只手動。
+目前 hontaka 與 sugar-butter-tree 各排 JST 10:00。
+
+四個設計重點：
+
+- **序列執行**。多品牌撞同一時間就排隊，併行會同時打 OpenAI 與 Shopify 觸發限流。
+- **同一天只跑一次**，用「已執行日期」比對而不是精準對時 ——
+  容器重啟、時鐘漂移、執行超過一分鐘都不會漏跑或重複跑。
+- **不補跑**。服務若在排程時間之後才啟動（例如中午重新部署），當天不會立刻補跑，
+  那通常不是預期行為，也可能撞上手動操作。要補跑就手動按。
+- **上一輪還在跑就跳過**，不會疊加。
+
+介面上「排程狀態」按鈕會列出排程時間與上次執行結果。
+
+> ⚠️ **只在單一 worker 執行。** Procfile 用 `-w 1`；若改成多 worker，
+> 每個 worker 會各自排程 → 重複執行。要擴充 worker 數就必須改用外部排程
+> （Zeabur Cron 打 `/api/<slug>/start?token=...`）。
+
+## 網路韌性
+
+Shopify 呼叫用帶重試的 session：4 次、指數退避（1.5s→3s→6s→12s），
+涵蓋 429 與 5xx。
+
+**POST 刻意不自動重試** —— 建立商品若在回應遺失時重送會產生重複商品。
+urllib3 的 `allowed_methods` 預設只含冪等方法，不要為了「更保險」把 POST 加進去。
+
+同步迴圈對單件商品的例外容錯：記錄後跳過，連續 `MAX_CONSECUTIVE_ERRORS` 件
+失敗才中止（網站掛掉時及早停手，避免把整個 collection 判定成已下架）。
 
 ## 存取控制
 

@@ -12,6 +12,11 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 # 升版必須同時把建立商品改走 GraphQL productSet。詳見 README。
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-01")
 
+# ---- 排程 ----
+# 關閉後只能手動觸發。本機測試時建議關閉，避免不小心跑到正式資料。
+SCHEDULER_ENABLED = os.environ.get(
+    "SCHEDULER_ENABLED", "1").lower() in ("1", "true", "yes")
+
 # ---- 存取控制 ----
 # 設了就必須帶 token 才能觸發同步。舊的 12 支服務沒有這層保護，
 # 但它們的清理階段本來就壞著（抓不到 collection SKU），誤觸也刪不掉東西。

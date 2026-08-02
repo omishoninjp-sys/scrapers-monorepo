@@ -7,6 +7,7 @@ from werkzeug.exceptions import HTTPException
 
 from . import config, registry
 from .shopify import ShopifyClient
+from .scheduler import enabled as scheduler_enabled, get_scheduler
 from .sync import SyncRunner
 from .translate import translate
 
@@ -20,6 +21,16 @@ def runner_for(slug):
         if slug not in _runners:
             _runners[slug] = SyncRunner(registry.get(slug))
         return _runners[slug]
+
+
+scheduler = get_scheduler(runner_for)
+if scheduler_enabled():
+    scheduler.start()
+
+
+@app.route("/api/schedule")
+def api_schedule():
+    return jsonify({"enabled": scheduler_enabled(), "jobs": scheduler.status()})
 
 
 @app.errorhandler(Exception)
@@ -302,6 +313,7 @@ label.chk{font-size:13px;color:#555}
 <button class="ghost" onclick="testScrape()">測試爬取</button>
 <button class="ghost" onclick="checkCollections()">檢查 Collection</button>
 <button class="ghost" onclick="audit()">資料健檢</button>
+<button class="ghost" onclick="showSchedule()">排程狀態</button>
 <button class="ghost" onclick="migrateSku(false)">SKU 遷移計畫</button>
 <button class="ghost" onclick="migrateSku(true)">執行 SKU 遷移</button>
 <button class="ghost" onclick="dedup(false)">重複清理計畫</button>
@@ -356,6 +368,14 @@ async function checkCollections(){log('檢查 Collection...');
   if(r.data.error)return log('✗ '+r.data.error,'err');
   r.data.collections.forEach(c=>log(c.id?('   '+c.title+' → id '+c.id+' ('+c.kind+') 商品 '+c.product_count+' 件')
     :('   '+c.title+' → 不存在'), c.id?'ok':'warn'))}
+async function showSchedule(){
+  const r=await call('/api/schedule');
+  if(!r.ok)return log('✗ HTTP '+r.status+' 非 JSON：'+r.text,'err');
+  if(!r.data.enabled)return log('排程已停用（SCHEDULER_ENABLED=0）','warn');
+  if(!r.data.jobs.length)return log('沒有品牌設定排程','warn');
+  log('排程（日本時間）：','ok');
+  r.data.jobs.forEach(j=>log('   '+j.at+' '+j.name+
+    (j.last_run?('｜上次 '+j.last_run+'：'+(j.last_result||'')):'｜尚未執行')))}
 async function audit(){log('資料健檢（約 30 秒）...');
   const r=await call('/api/'+slug()+'/audit');
   if(!r.ok)return log('✗ HTTP '+r.status+' 非 JSON：'+r.text,'err');

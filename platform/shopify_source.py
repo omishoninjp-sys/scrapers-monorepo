@@ -76,41 +76,55 @@ class ShopifySourceBrand(BaseBrand):
         self.warm_up()
         self._raw = {}
         items = []
+        # 逐項統計被哪個條件篩掉。全部篩光時，這份統計就是唯一的線索 ——
+        # 「官網列表 0 件」本身不區分「抓不到」與「抓到了但全被過濾」，
+        # 而這兩件事的處理方式完全相反。
+        dropped = {"no_sku": 0, "type": 0, "handle": 0, "tags": 0, "dup": 0}
         for page in range(1, self.max_pages + 1):
-            data, why = self._fetch_json(self.list_page_url(page))
-            if data is None and page == 1:
-                # 第一頁失敗多半是暫時性的（冷啟動、限流、DNS）。直接放行的話，
-                # 清理階段會把整個 collection 判定成「官網全部下架」。
+            url = self.list_page_url(page)
+            data, why = self._fetch_json(url)
+            products = (data or {}).get("products", [])
+            if page == 1 and not products:
+                # 第一頁空白多半是暫時性的（冷啟動、限流、資料中心 IP 被擋）。
+                # 直接放行的話，清理階段會把整個 collection 判定成「官網全部下架」。
+                # 注意 HTTP 200 但 products 為空也算失敗：部分站台的機器人防護
+                # 就是回 200 加一份空清單，靜靜 break 掉會完全看不出problem。
                 for attempt in range(3):
                     time.sleep(3 * (attempt + 1))
-                    data, why = self._fetch_json(self.list_page_url(page))
-                    if data is not None:
+                    data, why = self._fetch_json(url)
+                    products = (data or {}).get("products", [])
+                    if products:
+                        why = None
                         break
-            if data is None:
-                if page == 1:
+                if not products:
                     raise RuntimeError(
-                        f"{self.name} 商品列表抓取失敗（重試 3 次）：{why}。"
-                        f"網址 {self.list_page_url(1)}")
-                break
-            products = data.get("products", [])
+                        f"{self.name} 商品列表抓取失敗（重試 3 次）："
+                        + (why or "HTTP 200 但 products 為空清單（可能被機器人防護擋下）")
+                        + f"。網址 {url}")
             if not products:
                 break
             for p in products:
                 sku = self._pick_sku(p)
                 if not sku:
+                    dropped["no_sku"] += 1
                     continue
                 if self.only_types and p.get("product_type") not in self.only_types:
+                    dropped["type"] += 1
                     continue
                 if self.exclude_types and p.get("product_type") in self.exclude_types:
+                    dropped["type"] += 1
                     continue
                 if self.skip_handle_prefixes and (p.get("handle") or "").startswith(
                         tuple(self.skip_handle_prefixes)):
+                    dropped["handle"] += 1
                     continue
                 tags = p.get("tags") or []
                 if self.exclude_tags and any(
                         any(bad in t for bad in self.exclude_tags) for t in tags):
+                    dropped["tags"] += 1
                     continue
                 if sku in self._raw:
+                    dropped["dup"] += 1
                     continue
                 self._raw[sku] = p
                 items.append({"sku": sku,
@@ -118,6 +132,15 @@ class ShopifySourceBrand(BaseBrand):
             if len(products) < self.page_limit:
                 break
             time.sleep(self.request_delay)
+        if not items:
+            # 抓得到商品卻一件都留不下來，是設定或來源結構變了，不是網路問題。
+            # no_sku 佔多數通常代表來源不再提供 available 欄位或全站缺貨。
+            raise RuntimeError(
+                f"{self.name} 抓到商品但全部被過濾（無 SKU {dropped['no_sku']}、"
+                f"分類 {dropped['type']}、handle {dropped['handle']}、"
+                f"標籤 {dropped['tags']}、重複 {dropped['dup']}）。"
+                f"請確認來源結構是否變更。")
+        self.last_dropped = dropped
         return items
 
     def _pick_sku(self, product):

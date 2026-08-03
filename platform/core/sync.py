@@ -135,7 +135,7 @@ class SyncRunner:
             st["phase"] = "爬取官網列表"
             items = self.brand.list_products()
             st["total"] = len(items)
-            website_skus = {i["sku"] for i in items}
+            website_skus = self.brand.listing_skus(items)
             self.log(f"官網列表 {len(items)} 件")
 
             # 空列表幾乎一定是抓取失敗，不是官網真的把商品全下架了。
@@ -186,10 +186,10 @@ class SyncRunner:
                     time.sleep(0.5)
                     continue
 
-                if sku in existing_skus:
-                    info = existing.get(sku, {})
-                    self._maybe_reactivate(sku, info)
-                    self._collect_price_change(product, info, collection_skus)
+                known = next((s for s in product.all_skus if s in existing_skus), None)
+                if known:
+                    self._maybe_reactivate(known, existing.get(known, {}))
+                    self._collect_price_change(product, collection_map)
                     st["skipped"] += 1
                     time.sleep(0.5)
                     continue
@@ -200,7 +200,7 @@ class SyncRunner:
                     self.error(f"上架例外 {sku}: {type(e).__name__}: {e}")
                     ok = False
                 if ok is True:
-                    existing_skus.add(sku)
+                    existing_skus.update(product.all_skus)
                     st["uploaded"] += 1
                     consecutive_failures = 0
                 elif ok == "kana_rejected":
@@ -279,23 +279,34 @@ class SyncRunner:
         else:
             self.error(f"重新上架失敗 {sku}")
 
-    def _collect_price_change(self, product: Product, info, collection_skus):
+    def _collect_price_change(self, product: Product, collection_map):
         """
         只蒐集待改價清單，不立即寫入。改價會直接影響營收，
         必須先過保險絲、且在 dry-run 也要看得到，才輪到寫入。
+
+        多規格商品逐規格比對：100g 與 200g 是兩個 variant_id、兩個價格，
+        只看商品層代表價會讓其他規格永遠停在舊價。
         """
-        if product.sku not in collection_skus:
+        if product.variants:
+            for v in product.sellable_variants:
+                self._queue_price_change(v.sku, collection_map.get(v.sku),
+                                         v.price, v.selling_price)
             return
+        self._queue_price_change(product.sku, collection_map.get(product.sku),
+                                 product.price, product.selling_price)
+
+    def _queue_price_change(self, sku, info, cost, new_price):
+        if not info:
+            return                      # 不在納管 collection 內，不動它
         variant_id = info.get("variant_id")
         if not variant_id:
             return
         old_price = info.get("price", 0)
-        new_price = product.selling_price
         if abs(new_price - old_price) < 1:
             return
         self._price_changes.append({
-            "sku": product.sku, "variant_id": variant_id,
-            "old": old_price, "new": new_price, "cost": product.price,
+            "sku": sku, "variant_id": variant_id,
+            "old": old_price, "new": new_price, "cost": cost,
             "delta_ratio": (new_price - old_price) / old_price if old_price else 0,
         })
 
@@ -360,7 +371,12 @@ class SyncRunner:
         pid = created["id"]
         variants = created.get("variants") or []
         if variants:
-            self.client.update_variant(variants[0]["id"], cost=f"{product.price:.2f}")
+            # 逐規格寫回成本；找不到對應就退回商品層代表成本。
+            cost_by_sku = {v.sku: v.price for v in product.sellable_variants}
+            for cv in variants:
+                cost = cost_by_sku.get((cv.get("sku") or "").strip(), product.price)
+                self.client.update_variant(cv["id"], cost=f"{cost:.2f}")
+            self.client.assign_variant_images(created, product)
         else:
             self.error(f"警告 {product.sku}: Shopify 沒有回傳 variant，"
                        f"請檢查 API 版本 {self.client.api_version}")

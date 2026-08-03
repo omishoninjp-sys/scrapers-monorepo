@@ -220,6 +220,29 @@ class ShopifyClient:
             raise ShopifyError(f"HTTP {r.status_code}: {r.text[:400]}")
         return r.json()["product"]
 
+    def assign_variant_images(self, created, product):
+        """
+        把規格對應到自己的圖片（客人選口味或顏色時看到對應的那張）。
+
+        用位置對應而不是圖片網址：Shopify 上傳後會把 src 換成自家 CDN 網址，
+        拿原始網址回頭比對必定失敗。created["images"] 的順序與送出時一致，
+        所以 Variant.image_index 可以直接當索引用。
+        """
+        variants = getattr(product, "sellable_variants", [])
+        if not variants or not any(v.image_index is not None for v in variants):
+            return 0
+        images = created.get("images") or []
+        by_sku = {(cv.get("sku") or "").strip(): cv.get("id")
+                  for cv in (created.get("variants") or [])}
+        done = 0
+        for v in variants:
+            idx, vid = v.image_index, by_sku.get(v.sku)
+            if idx is None or vid is None or idx >= len(images):
+                continue
+            if self.update_variant(vid, image_id=images[idx]["id"]):
+                done += 1
+        return done
+
     def update_variant(self, variant_id, **fields):
         r = self.session.put(self.url(f"variants/{variant_id}.json"), headers=self.headers,
                          json={"variant": {"id": variant_id, **fields}}, timeout=30)

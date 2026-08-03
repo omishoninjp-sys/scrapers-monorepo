@@ -150,6 +150,16 @@ class BaseBrand:
             return None
         return self.parse_detail(soup, url, sku)
 
+    def listing_skus(self, items):
+        """
+        官網列表這一輪佔用的完整 SKU 集合，清理階段用它判斷誰已下架。
+
+        單規格品牌就是商品 SKU 本身。多規格品牌必須連規格 SKU 一起回報 ——
+        Shopify 那側的 collection SKU 是逐規格展開的，只回報商品層 SKU 的話，
+        其餘規格會全部被判定「官網已下架」而排進刪除清單。
+        """
+        return {i["sku"] for i in items}
+
     def legacy_sku_keys(self, product: Product):
         """
         回傳這個商品在**舊 SKU 體系**下可能長什麼樣，用於遷移比對。
@@ -189,20 +199,66 @@ class BaseBrand:
         if route and route.notice_html:
             body = route.notice_html + body
         body += (self.shipping_html or "")
-        return {
+        return self._payload_shell(product, translated, route, body)
+
+    def _variant_rows(self, product: Product):
+        """
+        多規格商品展開成 Shopify variants + options。
+
+        規格名稱與選項值只做詞彙表替換，不送翻譯：variants[].option1 必須與
+        options[].values 逐字相同，交給模型翻兩次一定對不上；而「100g」「S」
+        這類值本來也不需要翻。
+        """
+        sellable = product.sellable_variants
+        if not sellable:
+            return None, None
+        rows = []
+        for v in sellable:
+            row = {
+                "sku": v.sku,
+                "price": f"{v.selling_price:.2f}",
+                "inventory_management": None,
+                "inventory_policy": "continue",
+                "requires_shipping": True,
+            }
+            for i, value in enumerate(v.option_values[:3]):
+                row[f"option{i + 1}"] = apply_glossary(value.strip(), self.glossary)
+            rows.append(row)
+        # options 的 values 只留還有貨的規格，否則 Shopify 會建出選不到東西的選項
+        options = []
+        for i, opt in enumerate(product.options[:3]):
+            values = []
+            for v in sellable:
+                if i < len(v.option_values):
+                    value = apply_glossary(v.option_values[i].strip(), self.glossary)
+                    if value not in values:
+                        values.append(value)
+            if values:
+                options.append({"name": apply_glossary(
+                    (opt.get("name") or "選項").strip(), self.glossary),
+                                "values": values})
+        return rows, (options or None)
+
+    def _payload_shell(self, product: Product, translated: dict, route, body):
+        variants, options = (self._variant_rows(product)
+                             if product.variants else (None, None))
+        if not variants:
+            variants = [{
+                "sku": product.sku,
+                "price": f"{product.selling_price:.2f}",
+                "inventory_management": None,
+                "inventory_policy": "continue",
+                "requires_shipping": True,
+            }]
+            options = None
+        payload = {
             "title": translated["title"],
             "body_html": body,
             "vendor": self.vendor or self.name,
             "product_type": self.product_type,
             "status": "active",
             "published": True,
-            "variants": [{
-                "sku": product.sku,
-                "price": f"{product.selling_price:.2f}",
-                "inventory_management": None,
-                "inventory_policy": "continue",
-                "requires_shipping": True,
-            }],
+            "variants": variants,
             "images": [{"src": u, "position": i + 1}
                        for i, u in enumerate(product.images)],
             "tags": (route.tags if route and route.tags else self.tags),
@@ -211,3 +267,6 @@ class BaseBrand:
             "metafields": [{"namespace": "custom", "key": "link",
                             "value": product.url, "type": "url"}],
         }
+        if options:
+            payload["options"] = options
+        return payload

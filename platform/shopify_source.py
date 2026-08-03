@@ -48,14 +48,28 @@ class ShopifySourceBrand(BaseBrand):
         return f"{base}/products.json?limit={self.page_limit}&page={page}"
 
     def _fetch_json(self, url):
-        r = self.session.get(url, timeout=45)
-        if r.status_code != 200:
-            return None
+        """
+        回傳 (data, 失敗原因)。成功時原因為 None。
+
+        原本失敗只回 None，呼叫端 break 掉就變成「官網列表 0 件」，
+        看不出到底是被擋、逾時、還是網址設錯 —— 同一份程式在別的機器上
+        跑得好好的，卻沒有任何線索可查。原因必須帶回去。
+        """
         try:
-            return r.json()
+            # products.json 明確要 JSON。共用的 BROWSER_HEADERS 宣告的是
+            # text/html，部分站台會據此回 HTML 或直接擋掉資料中心 IP。
+            r = self.session.get(url, timeout=45,
+                                 headers={"Accept": "application/json, */*;q=0.8"})
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}（回應前 120 字：{r.text[:120]}）"
+        try:
+            return r.json(), None
         except ValueError:
             # Hydrogen 前台會回 HTML，代表 json_base 設錯了
-            return None
+            return None, ("回應不是 JSON，可能 json_base 設錯或被擋"
+                          f"（Content-Type: {r.headers.get('Content-Type')}）")
 
     def list_products(self):
         """一次把整份 JSON 撈回來，明細不需要再打第二次請求。"""
@@ -63,8 +77,20 @@ class ShopifySourceBrand(BaseBrand):
         self._raw = {}
         items = []
         for page in range(1, self.max_pages + 1):
-            data = self._fetch_json(self.list_page_url(page))
+            data, why = self._fetch_json(self.list_page_url(page))
+            if data is None and page == 1:
+                # 第一頁失敗多半是暫時性的（冷啟動、限流、DNS）。直接放行的話，
+                # 清理階段會把整個 collection 判定成「官網全部下架」。
+                for attempt in range(3):
+                    time.sleep(3 * (attempt + 1))
+                    data, why = self._fetch_json(self.list_page_url(page))
+                    if data is not None:
+                        break
             if data is None:
+                if page == 1:
+                    raise RuntimeError(
+                        f"{self.name} 商品列表抓取失敗（重試 3 次）：{why}。"
+                        f"網址 {self.list_page_url(1)}")
                 break
             products = data.get("products", [])
             if not products:

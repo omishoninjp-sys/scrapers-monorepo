@@ -72,6 +72,10 @@ MIN_FEE_PER_ITEM = 300
 JSON_FORMAT = ('{"title":"翻譯後的商品名稱","description":"翻譯後的商品說明（HTML格式）",'
                '"page_title":"SEO標題50字以內","meta_description":"SEO描述100字以內"}')
 
+# 部署版號。每次改完 core / platforms 就改這裡，同步 log 的第一行會印出來。
+# 「檔案換了但跑的還是舊的」這種問題，靠猜是查不出來的，必須有東西可以對。
+PLATFORM_VERSION = "2026-08-04a variant"
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",

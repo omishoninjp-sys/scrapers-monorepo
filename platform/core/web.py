@@ -51,6 +51,7 @@ def api_brands():
     return jsonify({"brands": registry.summary(),
                     "dry_run": config.DRY_RUN,
                     "token_required": bool(config.SYNC_TOKEN),
+                    "version": config.PLATFORM_VERSION,
                     "api_version": config.SHOPIFY_API_VERSION})
 
 
@@ -256,7 +257,10 @@ def api_test_scrape(slug):
                            "selling_price": p.selling_price, "in_stock": p.in_stock,
                            "images": len(p.images), "weight": p.weight,
                            "desc_len": len(p.description)})
-    return jsonify({"success": True, "list_count": len(items), "sample": sample})
+    return jsonify({"success": True, "version": config.PLATFORM_VERSION,
+                    "list_count": len(items),
+                    "dropped": getattr(brand, "last_dropped", None),
+                    "sample": sample})
 
 
 @app.route("/api/<slug>/start", methods=["POST"])
@@ -338,7 +342,8 @@ async function boot(){
   if(!r.ok){log('✗ HTTP '+r.status+' 非 JSON：'+r.text,'err');return}
   el('brand').innerHTML=r.data.brands.map(b=>'<option value="'+b.slug+'">'+b.name+
     (b.schedule?' ⏰'+b.schedule:'')+'</option>').join('');
-  log('已載入 '+r.data.brands.length+' 個品牌 / Shopify API '+r.data.api_version,'ok');
+  log('已載入 '+r.data.brands.length+' 個品牌 / Shopify API '+r.data.api_version
+      +' / 版本 '+(r.data.version||'未標示'),'ok');
   if(r.data.token_required&&!new URLSearchParams(location.search).get('token'))
     log('⚠ 此服務需要 token，請用 ?token=... 開啟本頁，否則無法觸發同步','warn');
   if(r.data.dry_run){el('dry').checked=true;log('環境變數 DRY_RUN 已啟用','warn')}

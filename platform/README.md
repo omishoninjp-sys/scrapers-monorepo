@@ -18,6 +18,9 @@
 | hontaka 本高砂屋 | ✅ 已遷移 | MakeShop |
 | kobe-fugetsudo 神戶風月堂 | ✅ 已遷移 | MakeShop |
 | shiseido 資生堂 PARLOUR | ✅ 已遷移 | ShiseidoParlour |
+| bluebottle Blue Bottle 藍瓶咖啡 | ✅ 新增（非遷移），排程 JST 07:00 | ShopifySource |
+
+共 13 個品牌。前 12 個是從舊服務遷移過來的，bluebottle 是直接在新平台上開的。
 
 舊的 12 支服務**都沒有動**，可以並行運行直到驗證完畢。
 
@@ -38,13 +41,15 @@ core/
 platforms/
   makeshop.py          MakeShopBrand（hontaka / kobe-fugetsudo）
   shiseido_parlour.py  ShiseidoParlour（自建站，單一品牌）
-  shopify_source.py    ShopifySourceBrand（toraya / yokumoku）
-  sucrey.py            SucreyBrand（cocoris / francais / maple-mania）
-  ecbeing.py           EcbeingBrand / EcbeingClassic / EcbeingSummary
+  shopify_source.py    ShopifySourceBrand（toraya / yokumoku / bluebottle）
   sucrey.py            SucreyBrand（cocoris / francais / maple-mania 共用）
-brands/
-  ogura.py
-  sugar_butter_tree.py
+  ecbeing.py           EcbeingBrand / EcbeingClassic / EcbeingSummary
+brands/                每個品牌一個檔案，registry 自動掃描載入
+  bankaku.py            bluebottle.py         cocoris.py
+  francais.py           gateaufesta_harada.py hontaka.py
+  kobe_fugetsudo.py     maple_mania.py        ogura.py
+  shiseido.py           sugar_butter_tree.py  toraya.py
+  yokumoku.py
 ```
 
 ## 新增品牌
@@ -90,7 +95,7 @@ brands/
 ## 排程器
 
 品牌用 `schedule = "10:00"`（**日本時間**）宣告每日同步，`None` 表示只手動。
-目前 hontaka 與 sugar-butter-tree 各排 JST 10:00。
+目前 hontaka 與 sugar-butter-tree 各排 JST 10:00，bluebottle 排 JST 07:00，其餘 10 個品牌只手動觸發。
 
 四個設計重點：
 
@@ -133,8 +138,8 @@ urllib3 的 `allowed_methods` 預設只含冪等方法，不要為了「更保�
 
 **先佈署新服務、驗證通過，再關舊服務。** 中間並存幾天，出事還有退路。
 
-sugar-butter-tree 的舊服務**先別關** —— 它有每日 JST 10:00 的排程，
-而新平台的排程器尚未實作（`schedule` 目前只是設定值）。
+排程器已在新平台實作（`core/scheduler.py`），舊服務的排程可以一併關掉 ——
+確認 `/api/schedule` 列出的排程時間與上次執行結果正常之後再關。
 
 ## 驗證步驟
 
@@ -532,5 +537,3 @@ adapter 會把「分類 × 分頁」攤平成一維序號給 `BaseBrand` 的迴�
 - 標題去重無法處理「全角半角括號不一致」的近似重複，例如
   `泉流 精裝禮盒 6個入精裝禮盒（6個入）`（SKU 25194/25196）。全站 140 件中僅 2 件，
   模型仍能產出合理標題，暫不處理。
-- 排程器（`schedule` 欄位）尚未實作。目前只是設定值，沿用舊服務的排程直到遷移完成。
-- 重複商品清理（原 `/api/dedup`）尚未移植。

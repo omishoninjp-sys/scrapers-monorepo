@@ -24,8 +24,20 @@ def runner_for(slug):
 
 
 scheduler = get_scheduler(runner_for)
-if scheduler_enabled():
-    scheduler.start()
+
+
+def start_scheduler():
+    """啟動排程器。由 app.py 在模組層級呼叫。
+
+    刻意不在 import 時自動啟動 —— 只要 import core.web 就會叫起排程器的話，
+    check_ui.py 這類「只想檢查前端 JS 語法」的工具也會觸發它。本機若帶著
+    正式 Shopify token，行程跨過 JST 排程時間就會對正式店真的跑同步。
+
+    放在 app.py 的模組層級（而不是 if __name__ == "__main__"）是因為
+    Procfile 用 `gunicorn app:app`，gunicorn 是 import app 模組而不是執行它。
+    """
+    if scheduler_enabled():
+        scheduler.start()
 
 
 @app.route("/api/schedule")
